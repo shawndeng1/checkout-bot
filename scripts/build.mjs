@@ -1,5 +1,5 @@
 import { build } from "esbuild";
-import { mkdir, copyFile } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 await mkdir("dist/electron", { recursive: true });
 await build({
   entryPoints: ["apps/desktop/electron/main.ts"],
@@ -18,7 +18,11 @@ await build({
   format: "cjs",
   external: ["electron"],
 });
-await copyFile(
-  "node_modules/sql.js/dist/sql-wasm.wasm",
-  "dist/electron/sql-wasm.wasm",
-);
+await build({
+  entryPoints: ["apps/desktop/electron/backend-worker.ts"],
+  outfile: "dist/electron/backend-worker.cjs",
+  bundle: true,
+  platform: "node",
+  format: "cjs",
+  sourcemap: true,
+});

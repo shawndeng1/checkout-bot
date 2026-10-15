@@ -1,13 +1,11 @@
 import { app, BrowserWindow, ipcMain } from "electron";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { Store } from "../../../packages/database/src/index";
-import { Engine } from "../../../packages/core/src/index";
+import { BackendClient } from "./backend-client";
 import { commandSchema } from "../../../packages/shared-types/src/index";
 import { ZodError } from "zod";
 app.setName("OrbitRetail");
-let engine: Engine;
-let store: Store;
+let engine: BackendClient;
 let window: BrowserWindow | null = null;
 let quitting = false;
 const lock = app.requestSingleInstanceLock();
@@ -20,14 +18,18 @@ else {
   app
     .whenReady()
     .then(async () => {
-      store = await Store.open(
+      engine = new BackendClient(
+        path.join(__dirname, "backend-worker.cjs"),
         path.join(
           process.env.RETAIL_DATA_DIR || app.getPath("userData"),
           "retail.sqlite",
         ),
-        path.join(__dirname, "sql-wasm.wasm"),
       );
-      engine = new Engine(store);
+      engine.on("failure", (error) => {
+        console.error("Backend unavailable", error);
+        app.exit(1);
+      });
+      await engine.ready;
       const renderer = pathToFileURL(
         path.join(__dirname, "../renderer/index.html"),
       ).href;
@@ -115,7 +117,6 @@ else {
       event.preventDefault();
       quitting = true;
       void engine.shutdown().then(() => {
-        store.close();
         app.quit();
       });
     }
