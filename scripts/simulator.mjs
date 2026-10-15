@@ -9,6 +9,10 @@ await build({
 const { startSimulator } = await import("../dist/simulator/index.mjs");
 const simulator = await startSimulator(
   Number(process.env.ORBIT_SIMULATOR_PORT ?? 4318),
+  {
+    databasePath:
+      process.env.ORBIT_SIMULATOR_DB ?? ".orbit-simulator/state.sqlite",
+  },
 );
 console.log(
   `Orbit simulator: ${simulator.url}\nControl token: ${simulator.token}`,

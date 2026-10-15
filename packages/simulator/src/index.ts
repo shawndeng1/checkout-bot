@@ -1,3 +1,4 @@
+import { SimulatorStorage } from "./storage";
 import { createServer, type IncomingMessage } from "node:http";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
@@ -32,12 +33,17 @@ async function body(request: IncomingMessage) {
   }
   return JSON.parse(Buffer.concat(chunks).toString() || "{}");
 }
-/** In-memory, loopback-only simulator. It never calls an external service. */
-export async function startSimulator(port = 0) {
+/** Loopback-only simulator, with an optional durable service database. */
+export async function startSimulator(
+  port = 0,
+  options: { databasePath?: string } = {},
+) {
+  const storage = new SimulatorStorage(options.databasePath);
   const token = randomUUID();
-  const streamId = randomUUID();
+  const streamId = storage.sourceId;
+  const inventoryStreamId = randomUUID();
   const completions = new Set<ReturnType<typeof setTimeout>>();
-  const products = [
+  const defaultProducts = [
     {
       id: "SKU-42",
       name: "Orbit demo product",
@@ -47,17 +53,50 @@ export async function startSimulator(port = 0) {
       ],
     },
   ];
-  const carts = new Map<string, CartResult>();
-  const orders = new Map<
-    string,
-    {
-      cartId: string;
-      result?: CheckoutResult;
-      status: "completed" | "failed" | "pending";
-      dueAt?: number;
-      sequence: number;
-    }
-  >();
+  const products =
+    storage.get<typeof defaultProducts>("metadata", "inventory") ??
+    defaultProducts;
+  type Order = {
+    cartId: string;
+    result?: CheckoutResult;
+    status: "completed" | "failed" | "pending";
+    dueAt?: number;
+    sequence: number;
+  };
+  const carts = {
+    get: (id: string) => storage.get<CartResult>("carts", id),
+    has: (id: string) => !!storage.get("carts", id),
+    set: (id: string, cart: CartResult) => storage.set("carts", id, cart),
+  };
+  const orders = {
+    get: (id: string) => storage.get<Order>("orders", id),
+    set: (id: string, order: Order) =>
+      storage.insertOrder(id, order.cartId, order),
+  };
+  const scheduleCompletion = (id: string, record: Order) => {
+    if (record.status !== "pending" || record.dueAt === undefined) return;
+    const timer = setTimeout(
+      () => {
+        const current = orders.get(id);
+        if (current?.status === "pending") {
+          try {
+            storage.updateOrder(id, {
+              ...current,
+              status: "completed",
+              sequence: current.sequence + 1,
+            });
+          } catch {
+            /* Durable pending evidence survives; restart can resume processing. */
+          }
+        }
+        completions.delete(timer);
+      },
+      Math.max(0, Math.min(2147483647, record.dueAt - Date.now())),
+    );
+    completions.add(timer);
+  };
+  for (const [id, order] of storage.pendingOrders<Order>())
+    scheduleCompletion(id, order);
   const controls = {
     latencyMs: 0,
     failNext: 0,
@@ -73,7 +112,7 @@ export async function startSimulator(port = 0) {
     inventoryRequests: 0,
     cartRequests: 0,
     checkoutRequests: 0,
-    ordersCreated: 0,
+    ordersCreated: storage.orderCount(),
     statusRequests: 0,
   };
   const server = createServer(async (request, response) => {
@@ -126,6 +165,7 @@ export async function startSimulator(port = 0) {
           }
           variant.available = change.available;
           variant.sequence++;
+          storage.set("metadata", "inventory", products);
           send(200, variant);
           return;
         }
@@ -167,7 +207,7 @@ export async function startSimulator(port = 0) {
           return;
         }
         send(200, {
-          streamId,
+          streamId: inventoryStreamId,
           eventId: `${ref.productId}:${variant.id}:${variant.sequence}`,
           retailerId: "simulator",
           product: ref,
@@ -288,27 +328,19 @@ export async function startSimulator(port = 0) {
           status: "completed",
           idempotencyKey: input.idempotencyKey,
         };
-        const record: {
-          cartId: string;
-          result: CheckoutResult;
-          status: "pending" | "completed";
-          sequence: number;
-        } = {
+        const record: Order = {
           cartId: input.cartId,
           result,
           status: controls.completionDelayMs > 0 ? "pending" : "completed",
           sequence: 1,
+          dueAt:
+            controls.completionDelayMs > 0
+              ? Date.now() + controls.completionDelayMs
+              : undefined,
         };
         orders.set(input.idempotencyKey, record);
         metrics.ordersCreated++;
-        if (controls.completionDelayMs > 0) {
-          const timer = setTimeout(() => {
-            record.status = "completed";
-            record.sequence++;
-            completions.delete(timer);
-          }, controls.completionDelayMs);
-          completions.add(timer);
-        }
+        scheduleCompletion(input.idempotencyKey, record);
         if (controls.dropCheckoutResponse) {
           request.socket.destroy();
           return;
@@ -328,7 +360,13 @@ export async function startSimulator(port = 0) {
   server.requestTimeout = 5000;
   server.headersTimeout = 5000;
   server.listen(port, "127.0.0.1");
-  await once(server, "listening");
+  try {
+    await once(server, "listening");
+  } catch (error) {
+    for (const timer of completions) clearTimeout(timer);
+    storage.close();
+    throw error;
+  }
   const address = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
   return {
     url: address,
@@ -340,6 +378,7 @@ export async function startSimulator(port = 0) {
       await new Promise<void>((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve())),
       );
+      storage.close();
     },
   };
 }
