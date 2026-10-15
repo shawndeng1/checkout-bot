@@ -1,29 +1,26 @@
 # Roadmap
 
-## Completed: Milestone 2 architecture and reliability
+## Completed: Milestone 3 inventory and reconciliation
 
-- Single backend worker owns native incremental SQLite with WAL and v1-compatible migrations/backups.
-- Operation-level concurrency, approval release/requeue, cancellation, duplicate approval prevention.
-- Shared inventory subscriptions, normalized observations, retailer rate policies, stale-event suppression.
-- Typed SDK and adapter registration, deterministic mock and loopback HTTP simulator.
-- Revisioned snapshot synchronization and conservative intent/approval/restart recovery.
-- Unit/integration/desktop tests and recorded 10/50/100-task backend benchmarks.
+- Preserved Electron/React application, single worker, SQLite WAL, scheduler and existing workflows.
+- Continuous inventory-only/notification workflows, normalized observation history, deduplicated in-app and optional native notices.
+- Independent SDK capabilities, optional purchasing methods, runtime registration/configuration validation.
+- Read-only simulator status lookup, lost/delayed results, durable reconciliation history, authoritative transactional resolution and desktop UI.
+- Shopify Storefront inventory-only adapter and functional loopback contract fixture; generic settings and OS-encrypted credentials.
+- v1/v2-compatible schema v3 migration/backups, crash/cancellation/write-failure and desktop coverage.
 
-## Recommended Milestone 3: Reconciliation and distribution reliability
+Milestone 2 architecture, validation, and measured benchmarks remain in [docs/MILESTONE_2.md](docs/MILESTONE_2.md).
 
-- Build a simulator order-status/reconciliation API and explicit UI resolution for UNKNOWN_OUTCOME, with tests proving that reconciliation cannot submit another order.
-- Exercise crash/kill points before/after each lifecycle commit and HTTP submission; add disk-full, power-loss, backup/restore and corruption tests.
-- Package and sign installers, pin supported Electron/Node runtimes, and run launch/migration tests on Windows and Linux CI.
-- Add worker health/status UI, startup deadlines, recovery diagnostics, and log export without sensitive data.
-- Replace full snapshots with revisioned incremental events plus paginated history for larger workspaces.
-- Add first-class profile/proxy group management and improved screen/form modularity, keyboard focus handling, and accessibility audits.
-- Expand benchmark sampling, process isolation, resource profiling and regression baselines.
+## Recommended Milestone 4: Authorized inventory pilot and distribution reliability
 
-## Later: Authorized integration development
+- Activate a developer-controlled Shopify store with explicit authorization; run the contract suite against published test products and real token/permission/revocation behavior.
+- Exercise OS-keychain lock/unlock, token rotation/deletion, native notification permissions, and signed installer migration on macOS, Windows and Linux CI.
+- Add a product/variant lookup browser, paginated observation/reconciliation history and sensitive-data-free diagnostics/export.
+- Persist simulator orders/source identity for durable service-restart reconciliation; keep absence and inconclusive evidence blocked.
+- Expand crash/kill points around database/credential commits and submission/result persistence; add physical disk-full, power-loss and backup/restore validation.
+- Add backend health/startup deadlines and recovery diagnostics; replace full snapshots with revisioned incremental updates.
+- Measure longer continuous-monitoring workloads and resource regressions; retain bounded queues and per-retailer policies.
 
-- Versioned adapter contracts, stronger conformance tests and plugin discovery.
-- OS keychain-backed authentication only if an explicitly scoped integration requires it.
-- Evaluate documented official retailer inventory APIs only with explicit authorization.
-- Any future purchasing requires an explicit user scope, clear approval UX, idempotency, order reconciliation, and a security review.
+## Later, separately authorized scope
 
-No real retailer integration, purchasing, access-control circumvention, or anti-bot bypass is included in the current application.
+Versioned adapter conformance and discovery, webhook-based official inventory sources, and further authorized inventory platforms. Any future real purchasing would require a separate user scope, approval UX, durable idempotency, authoritative reconciliation, and security review. No real checkout, access-control circumvention, CAPTCHA bypass, or queue bypass is implemented.
