@@ -1,6 +1,6 @@
 # Orbit — Retail Automation Workspace
 
-A working Electron desktop application through Milestone 3 for continuous inventory monitoring and simulated retail workflows. Independent implementation with original branding. Mock and loopback HTTP adapters simulate checkout; the Shopify inventory-only adapter supports a local contract fixture or explicitly authorized developer-store access. No real purchasing is implemented.
+A working Electron desktop application through Milestone 4 for continuous inventory monitoring and simulated retail workflows. Independent implementation with original branding. Mock and loopback HTTP adapters simulate checkout; the Shopify inventory-only adapter supports a local contract fixture or explicitly authorized developer-store access. No real purchasing is implemented.
 
 ## Requirements
 
@@ -34,7 +34,7 @@ This runs the bundled production renderer without a development server. Distribu
 
 Profiles accept shipping/contact details and `mock_` payment placeholders only. Proxies accept HTTP/SOCKS5 host and port configurations, without credentials. Profile/proxy groups are named in their forms and shown in the lists. Assign these configurations through the task form. The mock adapter does not use proxy routing or profile data.
 
-Choose **Monitor continuously** or **Monitor and notify** in the task form for inventory-only work. Open **Inventory** to see availability, variant observations, notification history, and monitoring controls. Open **Reconciliation** to check uncertain simulated checkout outcomes safely. See [inventory monitoring](INVENTORY_MONITORING.md) and [order reconciliation](ORDER_RECONCILIATION.md).
+Choose **Monitor continuously** or **Monitor and notify** in the task form for inventory-only work. Open **Discover** to search authorized products or look up handles/IDs, select variants, and create monitoring tasks. Open **Inventory** to see availability, details, freshness, last checks/errors, filters, paginated change history, notifications, and monitoring controls. Open **Reconciliation** to check uncertain simulated checkout outcomes safely. See [inventory monitoring](INVENTORY_MONITORING.md) and [order reconciliation](ORDER_RECONCILIATION.md).
 
 Settings control concurrency (1–20), startup view, completion/inventory notices, optional native notifications, and inventory log detail. Approval waits release execution capacity. Approval resumes through a bounded queue; duplicate approvals cannot submit twice. Lowering concurrency does not interrupt active operations. The resume-monitoring preference only resumes inventory checks; checkout is never retried automatically.
 
@@ -50,9 +50,11 @@ pnpm format:check
 
 Vitest exercises scheduling, shared inventory, the HTTP simulator, snapshot ordering, migrations, write failures, and worker recovery with isolated temporary directories and deterministic clocks. Tests that bind localhost require local network/listening permission. Playwright launches Electron directly; no separate browser download is required. GUI access is required; on headless Linux use `xvfb-run pnpm test:e2e`. Tests use a temporary data directory and do not change your workspace data. Screenshots/traces are written to `test-results/`.
 
+Settings also expose worker/database health, operation queues, subscriptions, polling, event latency, and safe error classifications. Credentials can be replaced or deleted without returning old values; rotation/deletion stops retailer work. Backend failure leaves diagnostics visible and blocks operations until recovery/restart.
+
 ## Data and security
 
-The database is `retail.sqlite` in Electron's per-user application data directory. `RETAIL_DATA_DIR` overrides the directory for tests or isolated development. One application instance owns the database. The worker is the only database owner and uses incremental native SQLite WAL writes. Existing v1/v2 databases are backed up once as `retail.sqlite.v1.bak` or `.v2.bak` before additive schema v3 migration. Monitoring may resume when configured; saved approvals require approval again. Interrupted checkout becomes `UNKNOWN_OUTCOME` and start/restart remains blocked until authoritative status evidence resolves it. Configuration, run history, and logs survive restart.
+The database is `retail.sqlite` in Electron's per-user application data directory. `RETAIL_DATA_DIR` overrides the directory for tests or isolated development. One application instance owns the database. The worker is the only database owner and uses incremental native SQLite WAL writes. Existing v1/v2/v3 databases are backed up once as `retail.sqlite.v<version>.bak` before additive schema v4 migration. Monitoring may resume when configured; saved approvals require approval again. Interrupted checkout becomes `UNKNOWN_OUTCOME` and start/restart remains blocked until authoritative status evidence resolves it. Configuration, run history, and logs survive restart.
 
 No raw card or retailer-password fields exist. Storefront API credentials use OS-backed encryption outside SQLite; public configuration and credential-presence indicators contain no tokens. Placeholder payment tokens must start with `mock_`. Contact data is local and not encrypted at rest; protect the operating-system account. Logs retain the latest 10,000 events; snapshots expose the latest 500 logs and runs.
 
@@ -70,7 +72,7 @@ No raw card or retailer-password fields exist. Storefront API credentials use OS
 - `scripts`: development and production bundling
 - `docs`: validation record and implementation notes
 
-Milestone 3 validation and limitations are recorded in [docs/MILESTONE_3.md](docs/MILESTONE_3.md). Milestone 2 history is recorded in [docs/MILESTONE_2.md](docs/MILESTONE_2.md). [docs/VALIDATION.md](docs/VALIDATION.md) is the historical Milestone 1 record.
+Milestone 4 results and limitations are recorded in [docs/MILESTONE_4.md](docs/MILESTONE_4.md). [docs/MILESTONE_3.md](docs/MILESTONE_3.md) remains the historical Milestone 3 record. Milestone 2 history is recorded in [docs/MILESTONE_2.md](docs/MILESTONE_2.md). [docs/VALIDATION.md](docs/VALIDATION.md) is the historical Milestone 1 record.
 
 ## HTTP simulation and benchmarks
 
@@ -81,7 +83,7 @@ ORBIT_SIMULATOR_URL=http://127.0.0.1:4318 pnpm dev
 pnpm benchmark
 ```
 
-The HTTP retailer appears in the group form only when registered through `ORBIT_SIMULATOR_URL`. Its catalog includes `SKU-42`, with an available `blue` variant. Enter `blue` in the optional variant field to exercise it. The default variant starts out of stock and can be changed with the authenticated local control API. See [simulator instructions](docs/SIMULATOR.md) and [measured backend benchmarks](docs/benchmarks/MILESTONE_2.md). The simulator never makes outbound requests. Shopify uses the fixture by default; authorized-store mode is a separately configured inventory-only API connection.
+The HTTP retailer appears in the group form only when registered through `ORBIT_SIMULATOR_URL`. The CLI persists simulated carts, orders, source identity and inventory in `.orbit-simulator/state.sqlite` (override `ORBIT_SIMULATOR_DB`). Keep that file separate from the desktop database and restart on the same origin for reconciliation. Its catalog includes `SKU-42`, with an available `blue` variant. Enter `blue` in the optional variant field to exercise it. The default variant starts out of stock and can be changed with the authenticated local control API. See [simulator instructions](docs/SIMULATOR.md) and [repeated backend benchmarks](PERFORMANCE.md). The simulator never makes outbound requests. Shopify uses the fixture by default; authorized-store mode is a separately configured inventory-only API connection.
 
 ## Shopify inventory fixture
 
@@ -91,6 +93,6 @@ pnpm fixture:shopify
 pnpm dev
 ```
 
-In Settings, save the Shopify fixture origin `http://127.0.0.1:4319`. Create a Shopify group and monitor-and-notify task for `orbit-shirt` and optional variant `gid://shopify/ProductVariant/1`. The [integration guide](RETAILER_INTEGRATION_GUIDE.md) explains stock controls, documented API authorization, secure token storage, and live activation steps. Live Shopify access was not validated because developer-store credentials were unavailable.
+In Settings, save the Shopify fixture origin `http://127.0.0.1:4319`. Create a Shopify group and monitor-and-notify task for `orbit-shirt` and optional variant `gid://shopify/ProductVariant/1`. The [integration guide](RETAILER_INTEGRATION_GUIDE.md) explains stock controls, documented API authorization, secure token storage, and live activation steps. Live Shopify access is **NOT EXECUTED**, pending an authorized developer-store configuration. See [product discovery](PRODUCT_DISCOVERY.md) and the runnable [Shopify pilot](SHOPIFY_PILOT.md).
 
 See [ARCHITECTURE.md](ARCHITECTURE.md), [DATABASE.md](DATABASE.md), [TASK_ENGINE.md](TASK_ENGINE.md), and [ROADMAP.md](ROADMAP.md).

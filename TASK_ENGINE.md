@@ -1,4 +1,4 @@
-# Task lifecycle — Milestone 3
+# Task lifecycle — Milestone 4
 
 ```text
 CREATED → MONITORING → STOCK_DETECTED → CARTING → AWAITING_APPROVAL
@@ -21,6 +21,8 @@ Per-retailer gates constrain request concurrency and minimum spacing, and apply 
 ## Retries and typed adapter results
 
 Retryable normalized errors in inventory/cart operations allow the configured 0–5 retries. Exponential delay is `min(300 × 2^attempt, 10000)` ms, extended by a longer normalized Retry-After. Tests inject a shorter base. Successful out-of-stock observations continue polling; they do not count as failures. Checkout submission is never automatically retried, including for 429, timeout, or unknown transport errors.
+
+Discovery requests use the same bounded scheduler and abort support, with separate request IDs and optional search/lookup capability checks. They use up to two retries and do not reserve a logical purchasing task context. Credential replacement/deletion cancels retailer discovery and stops its tasks before changing credentials.
 
 The SDK provides typed product/variant references, inventory, cart, checkout, capability/authentication declarations, and rate-limit/error contracts. Adapter registration lives outside engine control flow. Inventory-only adapters may omit cart/checkout methods. Real adapters can only monitor/lookup products; purchasing workflows require simulated cart/checkout capabilities. Mock convenience methods remain for compatibility. The HTTP adapter accepts only a `127.0.0.1` HTTP origin, rejects redirects, validates response shapes, applies timeouts, and propagates AbortSignal cancellation.
 
@@ -50,4 +52,6 @@ Mock scenarios remain available: third-check availability, indefinitely out of s
 
 Order-status requests acquire bounded execution capacity, support cancellation, persist each lookup, and coalesce duplicates per task. The lookup never submits orders. Matching attempt/source/configuration identity, non-regressive fresh evidence, and an authoritative result are required for `UNKNOWN_OUTCOME → COMPLETED/FAILED`. The state/result/history/log writes share one transaction. Inconclusive/error results remain unknown. Interrupted lookups become interrupted history entries and may be requested again. [ORDER_RECONCILIATION.md](ORDER_RECONCILIATION.md) documents the contract and simulator controls.
 
-Structured logs retain task/run IDs, state, level, timestamp, and message. Debug mode records accepted out-of-stock observations. Revisioned snapshots are coalesced for UI delivery; full snapshots are still used rather than incremental patches.
+Simulator order evidence now survives a service restart when the same database and origin are reused. Pending timers resume independently; lookup still cannot submit. Ephemeral test mode, a missing/deleted database, or unverifiable legacy source metadata remains unknown.
+
+Structured logs retain task/run IDs, state, level, timestamp, and message. Debug mode records accepted out-of-stock observations. Revisioned snapshots are coalesced for UI delivery; inventory history uses separate keyset pages rather than snapshot rows. Other state still uses full snapshots. Durable monitoring health records last success and classified error without putting token/profile data in diagnostics.

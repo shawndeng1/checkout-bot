@@ -1,0 +1,13 @@
+# Milestone 4 measured inventory performance
+
+Recorded 2026-10-15T17:40:43.399Z; v24.19.0; darwin/x64; Intel(R) Core(TM) i5-1038NG7 CPU @ 2.00GHz.
+
+| Tasks | Trials / task-event samples | Stock p50 / p95 ms | CPU p50 / p95 one-core | Peak RSS MiB | Median worker heap MiB |
+| ----- | --------------------------- | ------------------ | ---------------------- | ------------ | ---------------------- |
+| 10    | 3 / 30                      | 27 / 61            | 6.91% / 9.54%          | 111.44       | 19.63                  |
+| 50    | 3 / 150                     | 31 / 38            | 10.4% / 10.43%         | 118.26       | 19.47                  |
+| 100   | 3 / 300                     | 71 / 157           | 15.65% / 16.86%        | 128.33       | 24.49                  |
+
+Each trial runs in a fresh child process with a fresh backend worker and in-memory loopback HTTP simulator, with temporary on-disk desktop SQLite/WAL. Trials run sequentially; process IDs are recorded to verify isolation, avoiding parent allocator/JIT retention across scales. Continuous MONITOR_ONLY tasks share one product/default-variant subscription; interval 100 ms, concurrency 10, simulator policy 10 ms / 4 requests. After all task starts, warm up 500 ms, then sample steady monitoring CPU for 2000 ms. CPU includes the measured trial process, its worker and simulator (not the orchestrator) and is normalized to one core. RSS is whole trial-process memory sampled every 10 ms from steady monitoring through stock snapshot receipt; worker heap is sampled before stock. Task latencies use persisted STOCK_DETECTED log timestamps minus the local inventory-change request send time. Pooled latency samples are correlated within each shared fan-out, not independent network samples. Per-scale p50/p95 are nearest-rank across pooled task events; CPU p50/p95 use trial-window percentages. Peak RSS is the maximum over trials. Full-snapshot IPC is included in overall readiness, not log-timestamp latency. Sources remain subscribed after stock and are cancelled on shutdown. Every trial verifies sharing, subscriber count, capacity and zero orders. These fixture measurements do not establish production Shopify, GUI rendering, cross-platform performance or an improvement over a differently defined historical workload.
+
+Raw per-trial measurements and task latencies: [milestone-4.json](docs/benchmarks/milestone-4.json). Run with Node 24.15+ using `pnpm benchmark`; `ORBIT_BENCHMARK_ITERATIONS` defaults to 3 (minimum 2). Historical [Milestone 2 samples](docs/benchmarks/MILESTONE_2.md) used a different checkout workflow and single samples; they are not a controlled regression baseline.

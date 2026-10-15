@@ -1,26 +1,23 @@
 # Roadmap
 
-## Completed: Milestone 3 inventory and reconciliation
+## Implemented: Milestone 4 discovery and practical monitoring
 
-- Preserved Electron/React application, single worker, SQLite WAL, scheduler and existing workflows.
-- Continuous inventory-only/notification workflows, normalized observation history, deduplicated in-app and optional native notices.
-- Independent SDK capabilities, optional purchasing methods, runtime registration/configuration validation.
-- Read-only simulator status lookup, lost/delayed results, durable reconciliation history, authoritative transactional resolution and desktop UI.
-- Shopify Storefront inventory-only adapter and functional loopback contract fixture; generic settings and OS-encrypted credentials.
-- v1/v2-compatible schema v3 migration/backups, crash/cancellation/write-failure and desktop coverage.
+- SDK-driven authorized search, lookup and variant selection with descriptions, images, availability and timestamps.
+- Shopify Storefront 2026-07 discovery, strict response/version validation, rate policy, timeouts and cancellation; fixture-backed validation and a gated live pilot suite.
+- Filterable inventory view, product/variant details, durable last check/error and paginated change history outside snapshots.
+- Durable simulator carts, orders/idempotency, pending completion and restart-safe reconciliation.
+- Worker/database diagnostics and bounded error/latency reporting; scoped credential rotation/deletion and fail-closed OS encryption.
+- Repeated isolated 10/50/100-task measurements and macOS/Windows/Linux CI preparation.
 
-Milestone 2 architecture, validation, and measured benchmarks remain in [docs/MILESTONE_2.md](docs/MILESTONE_2.md).
+Historical milestone reports remain in docs. Live Shopify pilot status is **NOT EXECUTED** until an authorized developer-store setup is supplied and tested. Remote CI configuration is not evidence of platform success; see [Milestone 4 results](docs/MILESTONE_4.md).
 
-## Recommended Milestone 4: Authorized inventory pilot and distribution reliability
+## Recommended Milestone 5: Verified inventory pilot and operational hardening
 
-- Activate a developer-controlled Shopify store with explicit authorization; run the contract suite against published test products and real token/permission/revocation behavior.
-- Exercise OS-keychain lock/unlock, token rotation/deletion, native notification permissions, and signed installer migration on macOS, Windows and Linux CI.
-- Add a product/variant lookup browser, paginated observation/reconciliation history and sensitive-data-free diagnostics/export.
-- Persist simulator orders/source identity for durable service-restart reconciliation; keep absence and inconclusive evidence blocked.
-- Expand crash/kill points around database/credential commits and submission/result persistence; add physical disk-full, power-loss and backup/restore validation.
-- Add backend health/startup deadlines and recovery diagnostics; replace full snapshots with revisioned incremental updates.
-- Measure longer continuous-monitoring workloads and resource regressions; retain bounded queues and per-retailer policies.
+- Run the documented developer-store pilot and record actual API authorization, publication, variant, stock-change, cancellation, notification and recovery results.
+- Verify real OS-keychain lock/unlock/rotation/deletion and native notification permissions on supported systems; address failures from the CI matrix.
+- Add an offline product index, saved searches, revisioned current-state deltas, pagination/export for other histories and multi-account integration scope.
+- Add explicit worker recovery controls and health UI, monitoring soak tests, backup/restore and physical disk-full/corruption fault tests.
+- Improve simulator backup/restore and order archival; keep missing/inconclusive order evidence blocked.
+- Package and sign installers when distribution is authorized.
 
-## Later, separately authorized scope
-
-Versioned adapter conformance and discovery, webhook-based official inventory sources, and further authorized inventory platforms. Any future real purchasing would require a separate user scope, approval UX, durable idempotency, authoritative reconciliation, and security review. No real checkout, access-control circumvention, CAPTCHA bypass, or queue bypass is implemented.
+Any real purchasing would require a separate scope, user approval design, durable idempotency and authoritative reconciliation review. No real checkout, scraping, CAPTCHA bypass, queue bypass or access-control circumvention is implemented.

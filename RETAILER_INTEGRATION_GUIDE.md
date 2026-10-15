@@ -4,7 +4,7 @@ Orbit includes an inventory-only Shopify Storefront adapter and a functioning lo
 
 ## Contract and registration
 
-Register factories in `packages/adapters/src/index.ts`; the engine has no retailer-name branches. The SDK declares product lookup, variants, inventory, cart, checkout, and order-status capabilities independently. Inventory-only adapters implement `observe` and `inventoryScope`, and may implement `lookupProduct`; cart, checkout, and status methods are optional. Registry registration validates capability shapes, IDs, uniqueness, and request policy; factory creation validates matching identity/capabilities and methods required by each advertised capability. The registry permits independent simulated capabilities and prohibits non-simulated cart/checkout/order-status capabilities. Task admission separately requires inventory for monitoring workflows.
+Register factories in `packages/adapters/src/index.ts`; the engine has no retailer-name branches. The SDK declares optional product search, product lookup, variants, inventory, cart, checkout, and order-status capabilities independently. Inventory-only adapters implement `observe` and `inventoryScope`, and may implement `lookupProduct`; cart, checkout, and status methods are optional. Registry registration validates capability shapes, IDs, uniqueness, and request policy; factory creation validates matching identity/capabilities and methods required by each advertised capability. The registry permits independent simulated capabilities and prohibits non-simulated cart/checkout/order-status capabilities. Task admission separately requires inventory for monitoring workflows.
 
 Attach a strict Zod `configurationSchema` and generic `configurationFields` descriptors (text/select/checkbox, optional defaults) to the registration. The Settings form renders them without retailer conditions in the core engine. Validate again when constructing an adapter. Unknown configuration keys are rejected. Define sharing scope to include relevant configuration/account/region identity and normalize all failures to `RetailerError`, with retryability, rate information, and submission certainty. Implement cancellation and response validation. Never include secrets in the configuration schema, scope string, logs, or snapshots.
 
@@ -33,7 +33,7 @@ curl -X POST http://127.0.0.1:4319/control \
   -d '{"available":true}'
 ```
 
-Controls also include `denied` (boolean), `throttled` (next N reads), `invalid` (boolean), and `latencyMs` (0–5000). The server accepts only the versioned inventory query, binds loopback, checks Host/Origin, limits bodies, and never forwards traffic. It does not emulate Shopify token issuance, all API schema details, or production limits. Mutation attempts are rejected. Fixture state resets on restart.
+Controls also include `denied` (boolean), `throttled` (next N reads), `invalid` (boolean), and `latencyMs` (0–5000). The server accepts only the versioned product lookup and search queries, binds loopback, checks Host/Origin, limits bodies, and never forwards traffic. It does not emulate Shopify token issuance, all API schema details, or production limits. Mutation attempts are rejected. Fixture state resets on restart.
 
 ## Activate an authorized developer store
 
@@ -49,7 +49,9 @@ The adapter pins Storefront API `2026-07`, pages variants (100/page, maximum 20 
 
 The renderer exposes only a password input. Its value is sent over sender-validated IPC, cleared after save, and never returned. Main uses OS-backed `safeStorage` (Keychain on macOS, DPAPI on Windows, supported secret-service/keyring backend on Linux) to encrypt credential values into `credentials.enc.json`, mode 0600 where supported, using an atomic rename. The worker receives decrypted credentials only in memory. Public configuration stays in SQLite. There is no plaintext fallback: unavailable encryption and Linux `basic_text`/unknown backends are rejected. Existing encrypted credentials are retained when encryption fails; inaccessible credentials pause monitoring recovery.
 
-Configuration commands are serialized. Validation happens before credential persistence; database commit failure attempts to restore the prior encrypted credential set. SQLite and the OS credential file are separate durability domains, so a process crash between their commits can require re-entering the correct token. Such a mismatch cannot enable purchasing. Token replacement is supported; dedicated credential deletion/rotation management is future work. Tests use an injected encryption provider; live OS-keychain round trips and Linux/Windows secret services were not exercised.
+Configuration commands are serialized. Validation happens before credential persistence; database commit failure attempts to restore the prior encrypted credential set. SQLite and the OS credential file are separate durability domains, so a process crash between their commits can require re-entering the correct token. Such a mismatch cannot enable purchasing. Scoped replacement/deletion stops retailer work and preserves unrelated ciphertext, including entries that could not be decrypted on launch. Deletion does not need decryption of the removed entry. Credential availability and OS-encryption failures are visible in Settings diagnostics. Tests use an injected encryption provider; live OS-keychain round trips and Linux/Windows secret services were not exercised.
+
+See [PRODUCT_DISCOVERY.md](PRODUCT_DISCOVERY.md) for UI and pagination and [SHOPIFY_PILOT.md](SHOPIFY_PILOT.md) for exact authorized live setup. Live validation remains NOT EXECUTED pending credentials. The API version is still 2026-07; a different reported server API version is rejected. Search uses the documented product-only Storefront search query and does not scrape.
 
 ## Official references
 
@@ -60,4 +62,4 @@ Configuration commands are serialized. Validation happens before credential pers
 - [Shopify API response codes](https://shopify.dev/docs/api/usage/response-codes)
 - [Electron safeStorage behavior](https://www.electronjs.org/docs/latest/api/safe-storage)
 
-Unsupported: Admin inventory mutations, quantity/warehouse tracking, OAuth enrollment, webhook ingestion, arbitrary retailer URLs, browser scraping, CAPTCHA/queue/access-control bypass, real cart/checkout/order submission, remote order reconciliation, and a product-catalog browser in the desktop. Product/variant lookup is available through the adapter; the task form currently accepts identifiers directly.
+Unsupported: Admin inventory mutations, quantity/warehouse tracking, OAuth enrollment, webhook ingestion, arbitrary retailer URLs, browser scraping, CAPTCHA/queue/access-control bypass, real cart/checkout/order submission, remote order reconciliation, and arbitrary catalog crawling. The desktop now exposes authorized search/lookup and variant selection; adapters without discovery retain direct identifier entry.
