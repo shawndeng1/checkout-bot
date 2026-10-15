@@ -885,3 +885,76 @@ select {
   max-width: 290px;
   overflow-wrap: anywhere;
 }
+.discovery-controls {
+  display: flex;
+  gap: 14px;
+  padding: 20px;
+  flex-wrap: wrap;
+  align-items: flex-end;
+}
+.discovery-controls label {
+  display: grid;
+  gap: 8px;
+  flex: 1;
+  min-width: 180px;
+}
+.product-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 20px;
+  padding: 20px;
+}
+.product-card {
+  border: 1px solid #30333f;
+  border-radius: 12px;
+  padding: 16px;
+  display: grid;
+  gap: 12px;
+}
+.product-card p {
+  color: #9094a5;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.product-image {
+  width: 160px;
+  height: 140px;
+  object-fit: contain;
+  border-radius: 10px;
+  background: #11131a;
+}
+.image-placeholder {
+  display: grid;
+  place-items: center;
+  color: #9094a5;
+  font-size: 12px;
+}
+.product-detail {
+  display: flex;
+  gap: 24px;
+  padding: 24px;
+}
+.product-detail > div {
+  flex: 1;
+  min-width: 0;
+}
+.product-detail p {
+  overflow-wrap: anywhere;
+}
+.variant-list {
+  display: flex;
+  gap: 18px;
+  flex-wrap: wrap;
+  list-style: none;
+  padding: 12px 0;
+}
+.variant-list small {
+  display: block;
+  color: #9094a5;
+}
+.monitoring-form {
+  padding: 24px;
+}
+.credential-status-row {
+  display: contents;
+}

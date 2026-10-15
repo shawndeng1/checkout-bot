@@ -11,6 +11,7 @@ import type { Task } from "../../../shared-types/src/index";
 export const shopifyCapabilities: RetailerCapabilities = {
   inventory: true,
   productLookup: true,
+  productSearch: true,
   variants: true,
   cart: false,
   checkout: false,
@@ -75,40 +76,71 @@ export const shopifyConfig = z
         path: ["endpoint"],
       });
   });
-export const productQuery = `query OrbitInventory($id: ID, $handle: String, $after: String) { product(id: $id, handle: $handle) { id title variants(first: 100, after: $after) { nodes { id title availableForSale } pageInfo { hasNextPage endCursor } } } }`;
-const responseSchema = z.object({
-  data: z
-    .object({
-      product: z
-        .object({
-          id: z.string(),
-          title: z.string(),
-          variants: z.object({
-            nodes: z.array(
-              z.object({
-                id: z.string(),
-                title: z.string(),
-                availableForSale: z.boolean(),
-              }),
-            ),
-            pageInfo: z.object({
-              hasNextPage: z.boolean(),
-              endCursor: z.string().nullable(),
-            }),
-          }),
-        })
-        .nullable(),
-    })
-    .optional(),
-  errors: z
-    .array(
-      z.object({
-        message: z.string(),
-        extensions: z.object({ code: z.string().optional() }).optional(),
-      }),
-    )
-    .optional(),
+const fields = `id title handle availableForSale description(truncateAt: 10000) featuredImage { url altText }`;
+export const productQuery = `query OrbitInventory($id: ID, $handle: String, $after: String) { product(id: $id, handle: $handle) { ${fields} variants(first: 100, after: $after) { nodes { id title availableForSale selectedOptions { name value } } pageInfo { hasNextPage endCursor } } } }`;
+export const searchQuery = `query OrbitSearch($query: String!, $first: Int!, $after: String) { search(query: $query, types: [PRODUCT], unavailableProducts: SHOW, first: $first, after: $after) { nodes { ... on Product { ${fields} } } pageInfo { hasNextPage endCursor } } }`;
+const pageInfo = z.object({
+  hasNextPage: z.boolean(),
+  endCursor: z.string().max(2000).nullable(),
 });
+const summary = z.object({
+  id: z.string().min(1).max(200),
+  title: z.string().max(500),
+  handle: z.string().max(200),
+  description: z.string().max(10000),
+  availableForSale: z.boolean(),
+  featuredImage: z
+    .object({ url: z.string().url(), altText: z.string().max(500).nullable() })
+    .nullable(),
+});
+const productResponse = z.object({
+  product: summary
+    .extend({
+      variants: z.object({
+        nodes: z
+          .array(
+            z.object({
+              id: z.string().min(1).max(200),
+              title: z.string().max(500),
+              availableForSale: z.boolean(),
+              selectedOptions: z
+                .array(
+                  z.object({
+                    name: z.string().max(200),
+                    value: z.string().max(500),
+                  }),
+                )
+                .max(100),
+            }),
+          )
+          .max(100),
+        pageInfo,
+      }),
+    })
+    .nullable(),
+});
+const searchResponse = z.object({
+  search: z.object({ nodes: z.array(summary).max(50), pageInfo }),
+});
+function normalize(product: z.infer<typeof summary>): ProductDetails {
+  const url = product.featuredImage ? new URL(product.featuredImage.url) : null;
+  // A retailer image is display-only. Drop non-HTTPS URLs; never fetch it in the worker.
+  const image =
+    url && url.protocol === "https:" && !url.username && !url.password
+      ? { url: url.href, alt: product.featuredImage!.altText }
+      : null;
+  return {
+    id: product.id,
+    title: product.title,
+    handle: product.handle,
+    description: product.description,
+    image,
+    observedAt: Date.now(),
+    variants: [],
+    variantsComplete: false,
+    available: product.availableForSale,
+  };
+}
 export class ShopifyInventoryAdapter implements RetailerAdapter {
   readonly id = "shopify";
   readonly capabilities = shopifyCapabilities;
@@ -130,86 +162,104 @@ export class ShopifyInventoryAdapter implements RetailerAdapter {
   inventoryScope() {
     return JSON.stringify(this.config);
   }
-  async lookupProduct(
-    identifier: string,
+  private async request<T>(
+    query: string,
+    variables: Record<string, unknown>,
+    schema: z.ZodType<T>,
     signal: AbortSignal,
-  ): Promise<ProductDetails> {
-    const variants: ProductDetails["variants"] = [];
-    let after: string | null = null;
-    let details: ProductDetails | undefined;
-    for (let page = 0; page < 20; page++) {
-      let response: Response;
-      try {
-        response = await fetch(
-          this.config.endpoint.replace(/\/$/, "") + "/api/2026-07/graphql.json",
-          {
-            method: "POST",
-            headers: {
-              "content-type": "application/json",
-              ...(this.credential
-                ? { "X-Shopify-Storefront-Access-Token": this.credential }
-                : {}),
-            },
-            body: JSON.stringify({
-              query: productQuery,
-              variables: {
-                id: identifier.startsWith("gid://shopify/Product/")
-                  ? identifier
-                  : null,
-                handle: identifier.startsWith("gid://") ? null : identifier,
-                after,
-              },
-            }),
-            signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]),
-            redirect: "error",
+  ): Promise<T> {
+    let response: Response;
+    try {
+      response = await fetch(
+        this.config.endpoint.replace(/\/$/, "") + "/api/2026-07/graphql.json",
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            ...(this.credential
+              ? { "X-Shopify-Storefront-Access-Token": this.credential }
+              : {}),
           },
-        );
-      } catch {
+          body: JSON.stringify({ query, variables }),
+          signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]),
+          redirect: "error",
+        },
+      );
+      const apiVersion = response.headers.get("x-shopify-api-version");
+      if (apiVersion && apiVersion !== "2026-07")
         throw new RetailerError(
-          signal.aborted
-            ? "Inventory request cancelled"
-            : "Inventory request timed out or failed",
-          "NETWORK",
-          !signal.aborted,
+          "Unexpected Storefront API version; update adapter contract before continuing",
+          "INVALID_RESPONSE",
+          false,
         );
-      }
-      if (
-        response.status === 401 ||
-        response.status === 403 ||
-        response.status === 430
-      )
+      if ([401, 403, 430].includes(response.status))
         throw new RetailerError(
           "Storefront access denied; verify store authorization and token permissions",
           "AUTH",
           false,
         );
-      if (response.status === 429)
+      if (response.status === 429) {
+        const retry = response.headers.get("retry-after");
+        const parsed = Number(retry);
+        const ms =
+          retry && !Number.isFinite(parsed)
+            ? Date.parse(retry) - Date.now()
+            : (parsed || 1) * 1000;
         throw new RetailerError("Storefront rate limit", "RATE_LIMIT", true, {
-          retryAfterMs: Math.min(
-            60000,
-            Math.max(
-              500,
-              Number(response.headers.get("retry-after") ?? 1) * 1000 || 1000,
-            ),
+          retryAfterMs: Math.max(
+            500,
+            Math.min(60000, Number.isFinite(ms) ? ms : 1000),
           ),
         });
+      }
       if (!response.ok)
         throw new RetailerError(
           "Storefront service error",
           "NETWORK",
           response.status >= 500,
         );
-      const result = responseSchema.safeParse(
-        await response.json().catch(() => null),
-      );
-      if (!result.success)
+      const chunks: Uint8Array[] = [];
+      let length = 0;
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("No response");
+      try {
+        for (;;) {
+          const part = await reader.read();
+          if (part.done) break;
+          length += part.value.length;
+          if (length > 2 * 1024 * 1024)
+            throw new RetailerError(
+              "Storefront response too large",
+              "INVALID_RESPONSE",
+              false,
+            );
+          chunks.push(part.value);
+        }
+      } finally {
+        await reader.cancel().catch(() => {});
+      }
+      const payload = z
+        .object({
+          data: z.unknown().optional(),
+          errors: z
+            .array(
+              z.object({
+                extensions: z
+                  .object({ code: z.string().optional() })
+                  .optional(),
+              }),
+            )
+            .optional(),
+        })
+        .safeParse(JSON.parse(Buffer.concat(chunks).toString()));
+      if (!payload.success)
         throw new RetailerError(
           "Invalid Storefront response",
           "INVALID_RESPONSE",
           false,
         );
-      if (result.data.errors?.length) {
-        const limited = result.data.errors.some(
+      if (payload.data.errors?.length) {
+        const limited = payload.data.errors.some(
           (error) => error.extensions?.code === "THROTTLED",
         );
         throw new RetailerError(
@@ -221,31 +271,146 @@ export class ShopifyInventoryAdapter implements RetailerAdapter {
           limited ? { retryAfterMs: 1000 } : undefined,
         );
       }
-      const product = result.data.data?.product;
+      const result = schema.safeParse(payload.data.data);
+      if (!result.success)
+        throw new RetailerError(
+          "Invalid Storefront response",
+          "INVALID_RESPONSE",
+          false,
+        );
+      return result.data;
+    } catch (error) {
+      if (error instanceof RetailerError) throw error;
+      if (error instanceof SyntaxError)
+        throw new RetailerError(
+          "Invalid Storefront response",
+          "INVALID_RESPONSE",
+          false,
+        );
+      throw new RetailerError(
+        signal.aborted
+          ? "Inventory request cancelled"
+          : "Inventory request timed out or failed",
+        "NETWORK",
+        !signal.aborted,
+      );
+    }
+  }
+  async searchProducts(
+    query: string,
+    cursor: string | null,
+    limit: number,
+    signal: AbortSignal,
+  ) {
+    const input = z
+      .object({
+        query: z.string().trim().min(1).max(200),
+        cursor: z.string().max(2000).nullable(),
+        limit: z.number().int().min(1).max(50),
+      })
+      .parse({ query, cursor, limit });
+    const { search } = await this.request(
+      searchQuery,
+      { query: input.query, first: input.limit, after: input.cursor },
+      searchResponse,
+      signal,
+    );
+    if (
+      search.nodes.length > input.limit ||
+      new Set(search.nodes.map((product) => product.id)).size !==
+        search.nodes.length
+    )
+      throw new RetailerError(
+        "Invalid product page",
+        "INVALID_RESPONSE",
+        false,
+      );
+    if (
+      search.pageInfo.hasNextPage &&
+      (!search.pageInfo.endCursor || search.pageInfo.endCursor === cursor)
+    )
+      throw new RetailerError(
+        "Invalid product pagination",
+        "INVALID_RESPONSE",
+        false,
+      );
+    return {
+      products: search.nodes.map(normalize),
+      nextCursor: search.pageInfo.hasNextPage
+        ? search.pageInfo.endCursor
+        : null,
+    };
+  }
+  async lookupProduct(
+    identifier: string,
+    signal: AbortSignal,
+  ): Promise<ProductDetails> {
+    const variants: ProductDetails["variants"] = [];
+    let after: string | null = null;
+    const cursors = new Set<string>();
+    const ids = new Set<string>();
+    let details: ProductDetails | undefined;
+    for (let page = 0; page < 20; page++) {
+      const { product }: z.infer<typeof productResponse> = await this.request(
+        productQuery,
+        {
+          id: identifier.startsWith("gid://shopify/Product/")
+            ? identifier
+            : null,
+          handle: identifier.startsWith("gid://") ? null : identifier,
+          after,
+        },
+        productResponse,
+        signal,
+      );
       if (!product)
         throw new RetailerError(
           "Product not found or not published to this Storefront",
           "INVALID_RESPONSE",
           false,
         );
-      variants.push(
-        ...product.variants.nodes.map((variant) => ({
+      if (
+        identifier.startsWith("gid://")
+          ? product.id !== identifier
+          : product.handle.toLowerCase() !== identifier.toLowerCase()
+      )
+        throw new RetailerError(
+          "Product lookup identity mismatch",
+          "INVALID_RESPONSE",
+          false,
+        );
+      if (details && details.id !== product.id)
+        throw new RetailerError(
+          "Product pagination identity mismatch",
+          "INVALID_RESPONSE",
+          false,
+        );
+      for (const variant of product.variants.nodes) {
+        if (ids.has(variant.id))
+          throw new RetailerError(
+            "Duplicate variant page",
+            "INVALID_RESPONSE",
+            false,
+          );
+        ids.add(variant.id);
+        variants.push({
           id: variant.id,
           title: variant.title,
           available: variant.availableForSale,
-        })),
-      );
-      details = { id: product.id, title: product.title, variants };
+          attributes: variant.selectedOptions,
+        });
+      }
+      details = { ...normalize(product), variants, variantsComplete: true };
       if (!product.variants.pageInfo.hasNextPage) return details;
-      const cursor = product.variants.pageInfo.endCursor;
-      if (!cursor || cursor === after)
+      const cursor: string | null = product.variants.pageInfo.endCursor;
+      if (!cursor || cursors.has(cursor))
         throw new RetailerError(
           "Invalid variant pagination",
           "INVALID_RESPONSE",
           false,
         );
+      cursors.add(cursor);
       after = cursor;
-      // Pagination is part of one scheduled operation; pace additional API requests too.
       const { delay } = await import("../../../retailer-sdk/src/index");
       await delay(500, signal);
     }
@@ -281,6 +446,14 @@ export class ShopifyInventoryAdapter implements RetailerAdapter {
       availability: available
         ? ("in-stock" as const)
         : ("out-of-stock" as const),
+      details: {
+        title: product.title,
+        description: product.description,
+        image: product.image,
+        ...(variant
+          ? { variantTitle: variant.title, attributes: variant.attributes }
+          : {}),
+      },
     };
   }
 }

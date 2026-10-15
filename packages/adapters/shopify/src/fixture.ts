@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { randomUUID } from "node:crypto";
-import { productQuery } from "./index";
+import { productQuery, searchQuery } from "./index";
 /** Contract fixture for the documented Storefront query; never proxies external traffic. */
 export async function startShopifyFixture(port = 0) {
   const controlToken = randomUUID();
@@ -9,13 +9,25 @@ export async function startShopifyFixture(port = 0) {
     available: false,
     denied: false,
     throttled: 0,
+    http429: 0,
+    retryAfterMs: 1000,
     invalid: false,
     latencyMs: 0,
+    variantPageSize: 100,
+    catalogSize: 5,
+    apiVersion: "2026-07",
+    image: null as { url: string; altText: string | null } | null,
   };
   const metrics = { queries: 0, mutations: 0 };
   const server = createServer(async (req, res) => {
     const send = (code: number, data: unknown) => {
-      res.writeHead(code, { "content-type": "application/json" });
+      res.writeHead(code, {
+        "content-type": "application/json",
+        "x-shopify-api-version": state.apiVersion,
+        ...(code === 429
+          ? { "retry-after": String(state.retryAfterMs / 1000) }
+          : {}),
+      });
       res.end(JSON.stringify(data));
     };
     if (
@@ -64,7 +76,7 @@ export async function startShopifyFixture(port = 0) {
         send(404, {});
         return;
       }
-      if (body.query !== productQuery) {
+      if (body.query !== productQuery && body.query !== searchQuery) {
         if (String(body.query).includes("mutation")) metrics.mutations++;
         send(400, {
           errors: [{ message: "Only documented inventory query supported" }],
@@ -82,6 +94,11 @@ export async function startShopifyFixture(port = 0) {
         });
         return;
       }
+      if (state.http429 > 0) {
+        state.http429--;
+        send(429, { errors: [{ message: "Rate limited" }] });
+        return;
+      }
       if (state.throttled > 0) {
         state.throttled--;
         send(200, {
@@ -90,35 +107,86 @@ export async function startShopifyFixture(port = 0) {
         return;
       }
       if (state.invalid) {
-        send(200, { data: { product: 42 } });
+        send(200, {
+          data: body.query === searchQuery ? { search: 42 } : { product: 42 },
+        });
         return;
       }
-      if (
-        body.variables?.handle !== "orbit-shirt" &&
-        body.variables?.id !== "gid://shopify/Product/1"
-      ) {
+      const catalog = Array.from({ length: state.catalogSize }, (_, index) => ({
+        id: `gid://shopify/Product/${index + 1}`,
+        handle: index === 0 ? "orbit-shirt" : `orbit-shirt-${index + 1}`,
+        title:
+          index === 0
+            ? "Orbit fixture shirt"
+            : `Orbit fixture shirt ${index + 1}`,
+        description: "A developer-controlled inventory fixture. Cotton shirt.",
+        featuredImage: state.image,
+        availableForSale: state.available,
+      }));
+      if (body.query === searchQuery) {
+        const matches = catalog.filter((product) =>
+          product.title
+            .toLowerCase()
+            .includes(String(body.variables?.query ?? "").toLowerCase()),
+        );
+        const after = body.variables?.after ? Number(body.variables.after) : 0;
+        const first = Math.min(50, Number(body.variables?.first ?? 2));
+        const nodes = matches.slice(after, after + first);
+        send(200, {
+          data: {
+            search: {
+              nodes,
+              pageInfo: {
+                hasNextPage: after + nodes.length < matches.length,
+                endCursor: nodes.length ? String(after + nodes.length) : null,
+              },
+            },
+          },
+        });
+        return;
+      }
+      const product = catalog.find(
+        (product) =>
+          product.handle === body.variables?.handle ||
+          product.id === body.variables?.id,
+      );
+      if (!product) {
         send(200, { data: { product: null } });
         return;
       }
+      const baseVariant = catalog.indexOf(product) * 2 + 1;
+      const variants = [
+        {
+          id: `gid://shopify/ProductVariant/${baseVariant}`,
+          title: "Blue",
+          availableForSale: state.available,
+          selectedOptions: [
+            { name: "Color", value: "Blue" },
+            { name: "Size", value: "M" },
+          ],
+        },
+        {
+          id: `gid://shopify/ProductVariant/${baseVariant + 1}`,
+          title: "Red",
+          availableForSale: false,
+          selectedOptions: [
+            { name: "Color", value: "Red" },
+            { name: "Size", value: "M" },
+          ],
+        },
+      ];
+      const offset = Number(body.variables?.after ?? 0);
+      const nodes = variants.slice(offset, offset + state.variantPageSize);
       send(200, {
         data: {
           product: {
-            id: "gid://shopify/Product/1",
-            title: "Orbit fixture shirt",
+            ...product,
             variants: {
-              nodes: [
-                {
-                  id: "gid://shopify/ProductVariant/1",
-                  title: "Blue",
-                  availableForSale: state.available,
-                },
-                {
-                  id: "gid://shopify/ProductVariant/2",
-                  title: "Red",
-                  availableForSale: false,
-                },
-              ],
-              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes,
+              pageInfo: {
+                hasNextPage: offset + nodes.length < variants.length,
+                endCursor: nodes.length ? String(offset + nodes.length) : null,
+              },
             },
           },
         },

@@ -72,3 +72,31 @@ it("refuses unavailable OS encryption and Linux basic_text without writing plain
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+it("replaces and deletes one credential without rewriting other ciphertext, including deletion while locked", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "orbit-vault-rotate-"));
+  const file = join(dir, "credentials.enc.json");
+  try {
+    const crypto = provider(),
+      vault = new CredentialVault(file, crypto, "darwin");
+    await vault.save({ shopify: "first", other: "keep" });
+    const original = await vault.checkpoint();
+    await vault.replace("shopify", "replacement");
+    const next = await vault.checkpoint();
+    expect(next.other).toBe(original.other);
+    expect(next.shopify).not.toBe(original.shopify);
+    expect(await vault.load()).toEqual({
+      shopify: "replacement",
+      other: "keep",
+    });
+    expect(await readFile(file, "utf8")).not.toContain("replacement");
+    crypto.isEncryptionAvailable = () => false;
+    await vault.remove("shopify");
+    expect((await vault.checkpoint()).other).toBe(original.other);
+    expect((await vault.checkpoint()).shopify).toBeUndefined();
+    await vault.remove("other");
+    expect(await vault.load()).toEqual({});
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

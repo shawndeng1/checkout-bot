@@ -12,6 +12,7 @@ import type {
 } from "../../shared-types/src/index";
 import type { CartResult, CheckoutResult } from "../../retailer-sdk/src/index";
 import { migrations } from "./migrations";
+import { historySchema } from "../../shared-types/src/index";
 import { DatabaseSync, backup, type SQLInputValue } from "node:sqlite";
 import { mkdirSync, existsSync, chmodSync, renameSync, rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -184,7 +185,8 @@ export class Store {
     return {
       revision: this.revision(),
       retailers: [],
-      inventory: this.rows("inventory_events", "ORDER BY rowid DESC LIMIT 500"),
+      inventory: [],
+      monitoringHealth: this.rows("monitoring_health"),
       latestInventory: this.rows("latest_inventory"),
       notices: this.rows("notices", "ORDER BY rowid DESC LIMIT 100"),
       attempts: this.rows(
@@ -544,7 +546,21 @@ export class Store {
           receivedAt: new Date().toISOString(),
         };
         this.put("latest_inventory", taskId, record);
-        if (changed)
+        const health = this.read<
+          import("../../shared-types/src/index").MonitoringHealth
+        >("monitoring_health", taskId);
+        this.put("monitoring_health", taskId, {
+          ...health,
+          taskId,
+          lastSuccess: record.receivedAt,
+        });
+        if (
+          changed &&
+          (!previous ||
+            previous.runId !== task.runId ||
+            previous.observation.availability !== event.availability ||
+            previous.observation.quantity !== event.quantity)
+        )
           this.run("INSERT OR IGNORE INTO inventory_events VALUES(?,?,?)", [
             record.id,
             taskId,
@@ -590,7 +606,7 @@ export class Store {
               variant: task.variantId,
               retailer: event.retailerId,
               at: new Date().toISOString(),
-              message: `${task.product}${task.variantId ? " / " + task.variantId : ""} is available`,
+              message: `${event.details?.title ?? task.product}${task.variantId ? " / " + (event.details?.variantTitle ?? task.variantId) : ""} is available`,
             };
             this.run("INSERT INTO notices VALUES(?,?,?)", [
               key,
@@ -608,6 +624,85 @@ export class Store {
       );
       return notice;
     });
+  }
+  inventoryHistory(
+    input: import("../../shared-types/src/index").HistoryInput = {},
+  ) {
+    const query = historySchema.parse(input);
+    const clauses: string[] = [];
+    const params: SQLInputValue[] = [];
+    if (query.taskId) {
+      clauses.push("task_id=?");
+      params.push(query.taskId);
+    }
+    if (query.cursor) {
+      clauses.push("rowid<?");
+      params.push(query.cursor);
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT rowid,data FROM inventory_events ${clauses.length ? "WHERE " + clauses.join(" AND ") : ""} ORDER BY rowid DESC LIMIT ?`,
+      )
+      .all(...params, query.limit + 1);
+    const selected = rows.slice(0, query.limit);
+    return {
+      items: selected.map(
+        (row) => JSON.parse(String(row.data)) as InventoryRecord,
+      ),
+      nextCursor:
+        rows.length > query.limit ? Number(selected.at(-1)!.rowid) : null,
+      revision: this.revision(),
+    };
+  }
+  monitoringError(ids: string[], code: string, message: string) {
+    this.transaction(() => {
+      for (const id of ids) {
+        const health = this.read<
+          import("../../shared-types/src/index").MonitoringHealth
+        >("monitoring_health", id);
+        this.put("monitoring_health", id, {
+          ...health,
+          taskId: id,
+          lastError: { at: new Date().toISOString(), code, message },
+        });
+      }
+    });
+  }
+  private healthCache?: {
+    at: number;
+    value: {
+      available: boolean;
+      journalMode: unknown;
+      foreignKeys: unknown;
+      integrity: string;
+      checkedAt: string;
+    };
+  };
+  databaseHealth() {
+    if (this.healthCache && Date.now() - this.healthCache.at < 30000)
+      return this.healthCache.value;
+    let value;
+    try {
+      value = {
+        available: true,
+        ...this.diagnostics(),
+        integrity: String(
+          this.db.prepare("PRAGMA quick_check(1)").get()?.quick_check ??
+            "unknown",
+        ),
+        checkedAt: new Date().toISOString(),
+      };
+    } catch {
+      value = {
+        available: false,
+        journalMode: "unknown",
+        foreignKeys: 0,
+        integrity: "unavailable",
+        checkedAt: new Date().toISOString(),
+      };
+    }
+    this.healthCache = { at: Date.now(), value };
+    return value;
   }
   attempt(id: string) {
     return this.read<CheckoutAttempt>("checkout_attempts", id);

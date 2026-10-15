@@ -4,11 +4,15 @@ import {
   AdapterRegistry,
   RetailerError,
   delay,
+  productPageSchema,
   type RetailerAdapter,
   type CartResult,
 } from "../../retailer-sdk/src/index";
 import {
   commandSchema,
+  discoverySchema,
+  type DiscoveryInput,
+  type Diagnostics,
   type Command,
   type TaskState,
   type Task,
@@ -47,6 +51,30 @@ export class Engine extends EventEmitter {
     string,
     { controller: AbortController; promise: Promise<void> }
   >();
+  private discovery = new Map<
+    string,
+    {
+      retailerId: string;
+      controller: AbortController;
+      promise: Promise<unknown>;
+    }
+  >();
+  private latency: number[] = [];
+  private errors: Diagnostics["recentErrors"] = [];
+  private recordError(ids: string[], error: unknown, taskId?: string) {
+    const code = error instanceof RetailerError ? error.code : "UNKNOWN";
+    const at = new Date().toISOString();
+    this.errors.push(
+      ...(ids.length ? ids : [taskId]).map((taskId) => ({ at, code, taskId })),
+    );
+    this.errors = this.errors.slice(-50);
+    if (ids.length)
+      this.store.monitoringError(
+        ids,
+        code,
+        `Inventory ${code.toLowerCase()} error; see task execution status`,
+      );
+  }
   private eventTimer?: ReturnType<typeof setTimeout>;
   readonly scheduler: RequestScheduler;
   readonly inventory: SharedInventory;
@@ -78,8 +106,14 @@ export class Engine extends EventEmitter {
       },
       (ids, event, changed) => {
         const notice = store.recordInventory(ids, event, changed);
+        this.latency.push(Math.max(0, Date.now() - event.observedAt));
+        if (this.latency.length > 256) this.latency.shift();
         if (notice && store.getSettings().nativeNotifications)
           this.emit("native-notification", notice);
+        this.publish();
+      },
+      (ids, error) => {
+        this.recordError(ids, error);
         this.publish();
       },
     );
@@ -143,8 +177,18 @@ export class Engine extends EventEmitter {
       this.store.approval(id) !== undefined
     );
   }
-  diagnostics() {
+  diagnostics(): Diagnostics {
+    const sorted = [...this.latency].sort((a, b) => a - b);
     return {
+      workerAvailable: true,
+      sampledAt: new Date().toISOString(),
+      database: this.store.databaseHealth(),
+      recentErrors: [...this.errors].reverse(),
+      eventLatency: {
+        samples: sorted.length,
+        p50Ms: sorted[Math.max(0, Math.ceil(sorted.length * 0.5) - 1)] ?? 0,
+        p95Ms: sorted[Math.max(0, Math.ceil(sorted.length * 0.95) - 1)] ?? 0,
+      },
       activeOperations: this.scheduler.capacity.active,
       peakOperations: this.scheduler.capacity.peak,
       activeTasks: this.active.size,
@@ -167,11 +211,18 @@ export class Engine extends EventEmitter {
       throw new Error("Task execution limit reached");
     const task = this.store.task(id);
     const retailer = this.store.group(task.groupId).retailer;
-    const adapter = this.registry.create(
-      retailer,
-      this.store.retailerConfig(retailer),
-      this.credentials[retailer],
-    );
+    let adapter: RetailerAdapter;
+    try {
+      adapter = this.registry.create(
+        retailer,
+        this.store.retailerConfig(retailer),
+        this.credentials[retailer],
+      );
+    } catch (error) {
+      this.recordError([id], error);
+      this.publish();
+      throw error;
+    }
     if (
       !adapter.capabilities.inventory ||
       (task.workflow === "MONITOR_AND_CHECKOUT" &&
@@ -339,6 +390,7 @@ export class Engine extends EventEmitter {
         );
         return;
       }
+      if (context.checkoutStarted) this.recordError([], error, id);
       const unknown =
         context.checkoutStarted &&
         (!(error instanceof RetailerError) ||
@@ -394,6 +446,108 @@ export class Engine extends EventEmitter {
     context.approve();
     this.publish();
   }
+  async discover(input: DiscoveryInput) {
+    const request = discoverySchema.parse(input);
+    if (this.shuttingDown) throw new Error("Engine is shutting down");
+    if (this.discovery.has(request.requestId))
+      throw new Error("Duplicate discovery request");
+    if (this.discovery.size >= 20)
+      throw new Error("Discovery request limit reached");
+    const adapter = this.registry.create(
+      request.retailerId,
+      this.store.retailerConfig(request.retailerId),
+      this.credentials[request.retailerId],
+    );
+    if (
+      request.mode === "search"
+        ? !adapter.capabilities.productSearch || !adapter.searchProducts
+        : !adapter.capabilities.productLookup || !adapter.lookupProduct
+    )
+      throw new Error(
+        "Adapter does not support this discovery operation; enter identifiers directly",
+      );
+    const controller = new AbortController();
+    const entry = {
+      retailerId: adapter.id,
+      controller,
+      promise: Promise.resolve() as Promise<unknown>,
+    };
+    this.discovery.set(request.requestId, entry);
+    const action = async () => {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const result = await this.scheduler.execute(
+            adapter.id,
+            request.requestId,
+            controller.signal,
+            () =>
+              request.mode === "search"
+                ? adapter.searchProducts!(
+                    request.text,
+                    request.cursor,
+                    request.limit,
+                    controller.signal,
+                  )
+                : adapter.lookupProduct!(request.text, controller.signal).then(
+                    (product) => ({ products: [product], nextCursor: null }),
+                  ),
+          );
+          if (controller.signal.aborted) throw new Error("Discovery cancelled");
+          return productPageSchema.parse(result);
+        } catch (error) {
+          if (controller.signal.aborted) throw new Error("Discovery cancelled");
+          this.recordError([], error);
+          if (
+            !(error instanceof RetailerError) ||
+            !error.retryable ||
+            attempt >= 2
+          )
+            throw error;
+          await delay(
+            Math.max(
+              this.backoffMs * 2 ** attempt,
+              error.rateLimit?.retryAfterMs ?? 0,
+            ),
+            controller.signal,
+          );
+        }
+      }
+    };
+    const deadline = setTimeout(() => controller.abort(), 110000);
+    const promise = action().finally(() => {
+      clearTimeout(deadline);
+      this.discovery.delete(request.requestId);
+    });
+    entry.promise = promise;
+    return promise;
+  }
+  cancelDiscovery(id: string) {
+    this.discovery.get(id)?.controller.abort();
+  }
+  async suspendRetailer(retailerId: string) {
+    this.registry.get(retailerId);
+    const discoveries = [...this.discovery.values()].filter(
+      (entry) => entry.retailerId === retailerId,
+    );
+    discoveries.forEach((entry) => entry.controller.abort());
+    await Promise.allSettled(discoveries.map((entry) => entry.promise));
+    await Promise.all(
+      this.store
+        .snapshot()
+        .tasks.filter(
+          (task) =>
+            this.store.group(task.groupId).retailer === retailerId &&
+            this.isBusy(task.id),
+        )
+        .map((task) => this.stop(task.id)),
+    );
+  }
+  async clearCredential(retailerId: string) {
+    await this.suspendRetailer(retailerId);
+    delete this.credentials[retailerId];
+    this.publish();
+    return this.snapshot();
+  }
   async configureIntegration(
     retailerId: string,
     config: Record<string, unknown>,
@@ -410,6 +564,14 @@ export class Engine extends EventEmitter {
         )
     )
       throw new Error("Stop retailer tasks before changing configuration");
+    if (
+      [...this.discovery.values()].some(
+        (entry) => entry.retailerId === retailerId,
+      )
+    )
+      throw new Error(
+        "Cancel retailer discovery before changing configuration",
+      );
     const validated = this.registry.validateConfig(retailerId, config);
     this.registry.create(
       retailerId,
@@ -573,6 +735,9 @@ export class Engine extends EventEmitter {
   }
   async shutdown() {
     this.shuttingDown = true;
+    const searches = [...this.discovery.values()];
+    searches.forEach((entry) => entry.controller.abort());
+    await Promise.allSettled(searches.map((entry) => entry.promise));
     const lookups = [...this.reconciling.values()];
     lookups.forEach((item) => item.controller.abort());
     await Promise.all(lookups.map((item) => item.promise));

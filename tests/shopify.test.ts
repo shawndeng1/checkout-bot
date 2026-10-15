@@ -70,7 +70,7 @@ it("looks up a product by handle or ID and selects independent variants without 
 it("monitors and notifies through the shared pipeline, honoring the integration request floor", async () => {
   const id = add();
   engine.start(id);
-  await vi.waitFor(() => expect(store.snapshot().inventory.length).toBe(1));
+  await vi.waitFor(() => expect(store.inventoryHistory().items.length).toBe(1));
   const first = fixture.metrics.queries;
   await new Promise((resolve) => setTimeout(resolve, 150));
   expect(fixture.metrics.queries).toBe(first);

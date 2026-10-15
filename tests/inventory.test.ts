@@ -201,7 +201,7 @@ it("refreshes heartbeat freshness without adding duplicate history", async () =>
   await vi.advanceTimersByTimeAsync(10);
   const first = store.snapshot().latestInventory[0].observation.observedAt;
   await vi.advanceTimersByTimeAsync(300);
-  expect(store.snapshot().inventory).toHaveLength(1);
+  expect(store.inventoryHistory().items).toHaveLength(1);
   expect(
     store.snapshot().latestInventory[0].observation.observedAt,
   ).toBeGreaterThan(first);
@@ -248,7 +248,7 @@ it("rolls back inventory history, lifecycle and notices together on a database w
   ).toThrow("disk full");
   fail.mockRestore();
   expect(store.task(id).state).toBe("MONITORING");
-  expect(store.snapshot().inventory).toEqual([]);
+  expect(store.inventoryHistory().items).toEqual([]);
   expect(store.snapshot().notices).toEqual([]);
   expect(store.snapshot().latestInventory).toEqual([]);
 });

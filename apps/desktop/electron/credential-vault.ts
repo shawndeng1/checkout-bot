@@ -13,6 +13,14 @@ export class CredentialVault {
     private provider: EncryptionProvider,
     private platform = process.platform,
   ) {}
+  encryptionAvailable() {
+    try {
+      this.available();
+      return true;
+    } catch {
+      return false;
+    }
+  }
   private available() {
     if (
       !this.provider.isEncryptionAvailable() ||
@@ -25,16 +33,47 @@ export class CredentialVault {
         "OS keychain encryption is unavailable; credentials were not saved",
       );
   }
-  async load(): Promise<Record<string, string>> {
-    let text: string;
+  async checkpoint(): Promise<Record<string, string>> {
     try {
-      text = await readFile(this.path, "utf8");
+      const parsed: unknown = JSON.parse(await readFile(this.path, "utf8"));
+      if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        Array.isArray(parsed) ||
+        Object.entries(parsed).some(
+          ([key, value]) =>
+            !/^[-a-z0-9]{1,60}$/.test(key) || typeof value !== "string",
+        )
+      )
+        throw new Error("Invalid encrypted credential store");
+      return parsed as Record<string, string>;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
-      throw error;
+      throw new Error("Encrypted credential store is unreadable");
     }
+  }
+  async restore(encrypted: Record<string, string>) {
+    await mkdir(dirname(this.path), { recursive: true });
+    await writeFile(this.path + ".tmp", JSON.stringify(encrypted), {
+      mode: 0o600,
+    });
+    await rename(this.path + ".tmp", this.path);
+  }
+  async replace(id: string, value: string) {
     this.available();
-    const encrypted = JSON.parse(text);
+    const encrypted = await this.checkpoint();
+    encrypted[id] = this.provider.encryptString(value).toString("base64");
+    await this.restore(encrypted);
+  }
+  async remove(id: string) {
+    const encrypted = await this.checkpoint();
+    delete encrypted[id];
+    await this.restore(encrypted);
+  }
+  async load(): Promise<Record<string, string>> {
+    const encrypted = await this.checkpoint();
+    if (!Object.keys(encrypted).length) return {};
+    this.available();
     const result: Record<string, string> = {};
     for (const [id, value] of Object.entries(encrypted)) {
       if (typeof value !== "string")
@@ -49,10 +88,6 @@ export class CredentialVault {
     for (const [id, value] of Object.entries(values))
       if (value)
         encrypted[id] = this.provider.encryptString(value).toString("base64");
-    await mkdir(dirname(this.path), { recursive: true });
-    await writeFile(this.path + ".tmp", JSON.stringify(encrypted), {
-      mode: 0o600,
-    });
-    await rename(this.path + ".tmp", this.path);
+    await this.restore(encrypted);
   }
 }

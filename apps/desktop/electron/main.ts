@@ -12,8 +12,10 @@ import { CredentialVault } from "./credential-vault";
 import {
   commandSchema,
   integrationInputSchema,
+  discoverySchema,
+  historySchema,
 } from "../../../packages/shared-types/src/index";
-import { ZodError } from "zod";
+import { z, ZodError } from "zod";
 app.setName("OrbitRetail");
 let engine: BackendClient;
 let window: BrowserWindow | null = null;
@@ -52,8 +54,7 @@ else {
         credentials,
       );
       engine.on("failure", (error) => {
-        console.error("Backend unavailable", error);
-        app.exit(1);
+        console.error("Backend unavailable; restart Orbit to recover safely");
       });
       engine.on("native-notification", (notice) => {
         if (Notification.isSupported())
@@ -118,21 +119,91 @@ else {
         trusted(event);
         const parsed = integrationInputSchema.parse(input);
         return serialize(async () => {
+          if (parsed.credential !== undefined)
+            await engine.suspendRetailer(parsed.retailerId);
           await engine.configureIntegration(parsed, true);
-          const previous = credentials;
+          const checkpoint =
+            parsed.credential !== undefined
+              ? await vault.checkpoint()
+              : undefined;
           const updated =
             parsed.credential !== undefined
               ? { ...credentials, [parsed.retailerId]: parsed.credential }
               : credentials;
-          if (parsed.credential !== undefined) await vault.save(updated);
+          if (parsed.credential !== undefined)
+            await vault.replace(parsed.retailerId, parsed.credential);
           try {
             const next = await engine.configureIntegration(parsed);
             credentials = updated;
             return next;
           } catch (error) {
-            if (parsed.credential !== undefined) await vault.save(previous);
+            if (checkpoint) await vault.restore(checkpoint);
             throw error;
           }
+        });
+      });
+      const retailerId = z.string().regex(/^[a-z0-9-]{1,60}$/);
+      ipcMain.handle("retail:discover", (event, input) => {
+        trusted(event);
+        return engine.discover(discoverySchema.parse(input));
+      });
+      ipcMain.handle("retail:cancel-discovery", (event, id) => {
+        trusted(event);
+        return engine.cancelDiscovery(z.string().uuid().parse(id));
+      });
+      ipcMain.handle("retail:history", (event, input) => {
+        trusted(event);
+        return engine.history(historySchema.parse(input));
+      });
+      ipcMain.handle("retail:diagnostics", (event) => {
+        trusted(event);
+        return engine.diagnostics();
+      });
+      ipcMain.handle("retail:credential-status", async (event) => {
+        trusted(event);
+        const data = await engine.snapshot();
+        let encrypted: Record<string, string> = {};
+        let unreadable = false;
+        try {
+          encrypted = await vault.checkpoint();
+        } catch {
+          unreadable = true;
+        }
+        return {
+          encryptionAvailable: vault.encryptionAvailable(),
+          loadFailed:
+            unreadable || Object.keys(encrypted).some((id) => !credentials[id]),
+          entries: data.retailers
+            .filter((retailer) =>
+              retailer.capabilities.authentication.some(
+                (auth) => auth.kind !== "none",
+              ),
+            )
+            .map((retailer) => ({
+              retailerId: retailer.id,
+              status: credentials[retailer.id]
+                ? "available"
+                : encrypted[retailer.id] || unreadable
+                  ? "inaccessible"
+                  : "missing",
+            })),
+        };
+      });
+      ipcMain.handle("retail:delete-credential", (event, input) => {
+        trusted(event);
+        const id = retailerId.parse(input);
+        return serialize(async () => {
+          const data = await engine.snapshot();
+          if (
+            !data.retailers
+              .find((retailer) => retailer.id === id)
+              ?.capabilities.authentication.some((auth) => auth.kind !== "none")
+          )
+            throw new Error("Retailer has no credential configuration");
+          await engine.suspendRetailer(id);
+          await vault.remove(id);
+          delete credentials[id];
+          return engine.clearCredential(id);
         });
       });
       engine.on("snapshot", (snapshot) => {

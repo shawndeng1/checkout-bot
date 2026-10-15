@@ -36,6 +36,16 @@ async function boot() {
             request.command.credential,
             request.type === "validateIntegration",
           );
+        else if (request.type === "discover")
+          data = await engine.discover(request.command);
+        else if (request.type === "cancelDiscovery")
+          data = engine.cancelDiscovery(request.command);
+        else if (request.type === "history")
+          data = store.inventoryHistory(request.command);
+        else if (request.type === "suspendRetailer")
+          data = await engine.suspendRetailer(request.command);
+        else if (request.type === "clearCredential")
+          data = await engine.clearCredential(request.command);
         else if (request.type === "metrics") data = engine.diagnostics();
         else if (request.type === "command")
           data = await engine.command(request.command);
@@ -58,7 +68,13 @@ async function boot() {
         parentPort!.postMessage({ id: request.id, error: message });
       }
     };
-    if (request.command?.type === "reconcile") void perform();
+    if (
+      request.command?.type === "reconcile" ||
+      ["discover", "cancelDiscovery", "history", "metrics"].includes(
+        request.type,
+      )
+    )
+      void perform();
     else commands = commands.then(perform);
   });
   parentPort!.postMessage({ type: "ready" });

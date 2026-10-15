@@ -36,4 +36,11 @@ export const migrations = [
  CREATE TABLE retailer_configs(id TEXT PRIMARY KEY,data TEXT NOT NULL);
  `,
   },
+  {
+    version: 4,
+    sql: `
+ CREATE TABLE monitoring_health(id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,data TEXT NOT NULL);
+ INSERT INTO monitoring_health SELECT id,json_object('taskId',id,'lastSuccess',json_extract(data,'$.receivedAt')) FROM latest_inventory;
+ `,
+  },
 ];

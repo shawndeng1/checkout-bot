@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import type {
   Command,
   Snapshot,
+  HistoryPage,
 } from "../../../packages/shared-types/src/index";
 import { Badge, Button, Empty } from "../../../packages/ui/src/index";
 import { useWorkspace } from "./store";
@@ -11,13 +12,28 @@ const time = (value?: string) =>
   value ? new Date(value).toLocaleString() : "Never";
 export function InventoryView({ data, command }: Props) {
   const [now, setNow] = useState(Date.now());
+  const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState("all");
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, []);
-  const tasks = data.tasks.filter(
-    (task) => task.workflow !== "MONITOR_AND_CHECKOUT",
-  );
+  const tasks = data.tasks
+    .filter((task) => task.workflow !== "MONITOR_AND_CHECKOUT")
+    .filter((task) => {
+      const observation = data.latestInventory.find(
+        (row) => row.taskId === task.id,
+      )?.observation;
+      return (
+        `${task.name} ${task.product} ${task.variantId ?? ""} ${observation?.details?.title ?? ""}`
+          .toLowerCase()
+          .includes(search.toLowerCase()) &&
+        (filter === "all" ||
+          (filter === "active"
+            ? ["MONITORING", "STOCK_DETECTED"].includes(task.state)
+            : observation?.availability === filter))
+      );
+    });
   return (
     <div className="operations-stack">
       <section className="panel">
@@ -25,22 +41,48 @@ export function InventoryView({ data, command }: Props) {
           <h2>Inventory watches</h2>
           <span className="muted">Intervals honor retailer limits</span>
         </div>
+        <div className="discovery-controls">
+          <label>
+            Search monitoring tasks
+            <input
+              aria-label="Search monitoring tasks"
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+            />
+          </label>
+          <label>
+            Inventory filter
+            <select
+              aria-label="Inventory filter"
+              value={filter}
+              onChange={(event) => setFilter(event.target.value)}
+            >
+              <option value="all">All watches</option>
+              <option value="active">Active watches</option>
+              <option value="in-stock">Available</option>
+              <option value="out-of-stock">Unavailable</option>
+              <option value="unknown">Unknown</option>
+            </select>
+          </label>
+        </div>
         <table>
           <thead>
             <tr>
               <th>PRODUCT / VARIANT</th>
               <th>WORKFLOW</th>
               <th>AVAILABILITY</th>
-              <th>LAST OBSERVED</th>
+              <th>LAST SUCCESS / ERROR</th>
               <th>ACTIONS</th>
             </tr>
           </thead>
           <tbody>
             {tasks.map((task) => {
-              const row = data.latestInventory.find(
-                (item) => item.taskId === task.id,
+              const observation = data.latestInventory.find(
+                (row) => row.taskId === task.id,
+              )?.observation;
+              const health = data.monitoringHealth.find(
+                (row) => row.taskId === task.id,
               );
-              const observation = row?.observation;
               const expired =
                 observation &&
                 (observation.expiresAt ?? observation.observedAt + 30000) <=
@@ -53,10 +95,19 @@ export function InventoryView({ data, command }: Props) {
                   <td>
                     <strong>{task.name}</strong>
                     <small>
-                      {task.product}{" "}
-                      {task.variantId
-                        ? `· ${task.variantId}`
-                        : "· All variants"}
+                      {observation?.details?.title ?? task.product} ·{" "}
+                      {observation?.details?.variantTitle ??
+                        task.variantId ??
+                        "All variants"}
+                    </small>
+                    <small>{observation?.details?.description}</small>
+                    <small>
+                      {observation?.details?.attributes
+                        ?.map(
+                          (attribute) =>
+                            `${attribute.name}: ${attribute.value}`,
+                        )
+                        .join(" · ")}
                     </small>
                   </td>
                   <td>
@@ -79,11 +130,19 @@ export function InventoryView({ data, command }: Props) {
                         ? "Expired observation"
                         : (observation?.availability ?? "Not observed")}
                     </span>
+                    <small>
+                      {observation
+                        ? time(new Date(observation.observedAt).toISOString())
+                        : "Never observed"}
+                    </small>
                   </td>
                   <td>
-                    {observation
-                      ? time(new Date(observation.observedAt).toISOString())
-                      : "Never"}
+                    {time(health?.lastSuccess)}
+                    <small>
+                      {health?.lastError
+                        ? `${health.lastError.code} · ${time(health.lastError.at)}`
+                        : "No monitoring error"}
+                    </small>
                   </td>
                   <td>
                     <Button
@@ -104,25 +163,22 @@ export function InventoryView({ data, command }: Props) {
         </table>
         {!tasks.length && (
           <Empty>
-            Create a task with the Monitor continuously or Monitor and notify
-            workflow in Tasks.
+            No matching watches. Discover a product or create an inventory task
+            in Tasks.
           </Empty>
         )}
       </section>
       <section className="panel">
         <div className="panel-heading">
           <h2>Inventory notifications</h2>
-          <span className="muted">
-            Availability alerts · no contact or payment information
-          </span>
         </div>
         {data.notices.map((notice) => (
           <div className="activity-row" key={notice.id}>
             <div>
               <strong>{notice.message}</strong>
               <p>
-                {notice.retailer} · {notice.product}
-                {notice.variant ? ` · ${notice.variant}` : ""}
+                {notice.retailer} · {notice.product} ·{" "}
+                {notice.variant ?? "All variants"}
               </p>
             </div>
             <time>{time(notice.at)}</time>
@@ -134,34 +190,116 @@ export function InventoryView({ data, command }: Props) {
           </Empty>
         )}
       </section>
-      <section className="panel">
-        <div className="panel-heading">
-          <h2>Observation history</h2>
-          <span className="muted">
-            Latest 100 events · repeated heartbeats omitted
-          </span>
-        </div>
-        {data.inventory.slice(0, 100).map((row) => (
-          <div className="activity-row" key={row.id}>
-            <div>
-              <strong>
-                {data.tasks.find((task) => task.id === row.taskId)?.name ??
-                  row.taskId}
-              </strong>
-              <p>
-                {row.observation.product.productId} ·{" "}
-                {row.observation.product.variantId ?? "All variants"} ·{" "}
-                {row.observation.availability}
-              </p>
-            </div>
-            <time>{time(row.receivedAt)}</time>
-          </div>
-        ))}
-        {!data.inventory.length && (
-          <Empty>No inventory observations recorded.</Empty>
-        )}
-      </section>
+      <InventoryHistory data={data} />
     </div>
+  );
+}
+function InventoryHistory({ data }: { data: Snapshot }) {
+  const [taskId, setTaskId] = useState("");
+  const [cursors, setCursors] = useState<(number | undefined)[]>([undefined]);
+  const [page, setPage] = useState<
+    import("../../../packages/shared-types/src/index").HistoryPage | null
+  >(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [refresh, setRefresh] = useState(0);
+  const cursor = cursors.at(-1);
+  useEffect(() => {
+    let active = true;
+    setBusy(true);
+    setError("");
+    void window.retail
+      .history({ taskId: taskId || undefined, cursor, limit: 20 })
+      .then((result) => {
+        if (active) setPage(result);
+      })
+      .catch(() => {
+        if (active) setError("Inventory history unavailable");
+      })
+      .finally(() => {
+        if (active) setBusy(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [taskId, cursor, refresh]);
+  return (
+    <section className="panel">
+      <div className="panel-heading">
+        <h2>Observation history</h2>
+        <div className="toolbar">
+          <select
+            aria-label="History task"
+            value={taskId}
+            onChange={(event) => {
+              setTaskId(event.target.value);
+              setCursors([undefined]);
+            }}
+          >
+            <option value="">All tasks</option>
+            {data.tasks.map((task) => (
+              <option key={task.id} value={task.id}>
+                {task.name}
+              </option>
+            ))}
+          </select>
+          <Button
+            onClick={() => {
+              setCursors([undefined]);
+              setRefresh((value) => value + 1);
+            }}
+          >
+            Refresh history
+          </Button>
+        </div>
+      </div>
+      {busy && (
+        <p role="status" className="form-description">
+          Loading history…
+        </p>
+      )}
+      {error && <p role="alert">{error}</p>}
+      {page?.items.map((row) => (
+        <div className="activity-row" key={row.id}>
+          <div>
+            <strong>
+              {data.tasks.find((task) => task.id === row.taskId)?.name ??
+                row.taskId}
+            </strong>
+            <p>
+              {row.observation.details?.title ??
+                row.observation.product.productId}{" "}
+              ·{" "}
+              {row.observation.details?.variantTitle ??
+                row.observation.product.variantId ??
+                "All variants"}{" "}
+              · {row.observation.availability}
+            </p>
+          </div>
+          <time>{time(row.receivedAt)}</time>
+        </div>
+      ))}
+      {page && !page.items.length && (
+        <Empty>No inventory observations recorded.</Empty>
+      )}
+      <div className="modal-footer">
+        <span className="muted">
+          Page {cursors.length} · 20 observations per page
+        </span>
+        <Button
+          disabled={busy || cursors.length === 1}
+          onClick={() => setCursors((values) => values.slice(0, -1))}
+        >
+          Previous history
+        </Button>
+        <Button
+          disabled={busy || !page?.nextCursor}
+          onClick={() => setCursors((values) => [...values, page!.nextCursor!])}
+        >
+          Next history
+        </Button>
+      </div>
+    </section>
   );
 }
 export function ReconciliationView({ data, command }: Props) {
@@ -395,6 +533,33 @@ function IntegrationForm({
       </p>
       <div className="modal-footer">
         {message && <span role="status">{message}</span>}
+        <Button
+          type="button"
+          variant="danger"
+          disabled={busy}
+          onClick={async () => {
+            setBusy(true);
+            setMessage("");
+            try {
+              const snapshot = await window.retail.deleteCredential(
+                retailer.id,
+              );
+              useWorkspace.getState().setData(snapshot);
+              setCredential("");
+              setMessage("Credential deleted; monitoring stopped");
+            } catch (error) {
+              setMessage(
+                error instanceof Error
+                  ? error.message
+                  : "Credential deletion failed",
+              );
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          Delete credential
+        </Button>
         <Button type="submit" variant="primary" disabled={busy}>
           {busy ? "Saving…" : "Save integration"}
         </Button>

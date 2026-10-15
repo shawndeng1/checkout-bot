@@ -136,7 +136,9 @@ it("recovers inventory watches and their persisted observations after worker ter
     backend = new BackendClient(workerPath, database);
     await backend.ready;
     data = await backend.snapshot();
-    expect(data.inventory.length).toBeGreaterThan(0);
+    expect((await backend.history({ limit: 20 })).items.length).toBeGreaterThan(
+      0,
+    );
     expect(data.runs.find((row) => row.id === run)?.recovery).toBe(
       "interrupted-monitoring",
     );
@@ -144,6 +146,57 @@ it("recovers inventory watches and their persisted observations after worker ter
     expect(data.attempts).toEqual([]);
     await backend.command({ type: "stop", id });
   } finally {
+    await backend.shutdown().catch(() => {});
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it("reports unavailable diagnostics after worker exit without returning credentials or sensitive data", async () => {
+  const { writeFileSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "orbit-health-exit-")),
+    workerPath = join(dir, "exit.cjs");
+  writeFileSync(
+    workerPath,
+    "const {parentPort}=require('node:worker_threads');parentPort.on('message',()=>process.exit(7));parentPort.postMessage({type:'ready'});",
+  );
+  const backend = new BackendClient(workerPath, join(dir, "unused.sqlite"), {
+    shopify: "hidden-test-secret",
+  });
+  try {
+    await backend.ready;
+    const result = await backend.diagnostics();
+    expect(result.workerAvailable).toBe(false);
+    expect(result.recentErrors[0].code).toBe("WORKER_EXIT");
+    expect(JSON.stringify(result)).not.toContain("hidden-test-secret");
+  } finally {
+    await backend.shutdown().catch(() => {});
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it("times out worker health, blocks new operations and clears pending health RPCs for an unresponsive worker", async () => {
+  const { writeFileSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "orbit-health-hung-")),
+    workerPath = join(dir, "hung.cjs");
+  writeFileSync(
+    workerPath,
+    "const {parentPort}=require('node:worker_threads');parentPort.on('message',()=>{});parentPort.postMessage({type:'ready'});",
+  );
+  const backend = new BackendClient(workerPath, join(dir, "unused.sqlite"));
+  try {
+    await backend.ready;
+    const result = await backend.diagnostics();
+    expect(result.workerAvailable).toBe(false);
+    expect(result.recentErrors[0].code).toBe("WORKER_UNRESPONSIVE");
+    await expect(
+      backend.command({
+        type: "saveGroup",
+        data: { name: "Blocked", retailer: "mock" },
+      }),
+    ).rejects.toThrow("unresponsive");
+    expect((backend as any).requests.size).toBe(0);
+  } finally {
+    await (backend as any).worker.terminate();
     await backend.shutdown().catch(() => {});
     rmSync(dir, { recursive: true, force: true });
   }

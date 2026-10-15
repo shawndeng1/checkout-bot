@@ -29,7 +29,18 @@ test("desktop CRUD, live events, stop, logs and restart persistence", async () =
       })),
     ).toEqual({
       node: "undefined",
-      api: ["configureIntegration", "snapshot", "command", "subscribe"],
+      api: [
+        "discover",
+        "cancelDiscovery",
+        "history",
+        "diagnostics",
+        "credentialStatus",
+        "deleteCredential",
+        "configureIntegration",
+        "snapshot",
+        "command",
+        "subscribe",
+      ],
     });
     await page
       .getByRole("button", { name: "Tasks", exact: false })
@@ -426,10 +437,7 @@ test("inventory-only integration configuration, continuous variant monitoring, n
     ).toBeVisible();
     await expect(
       page
-        .getByText(
-          "orbit-shirt / gid://shopify/ProductVariant/1 is available",
-          { exact: true },
-        )
+        .getByText("Orbit fixture shirt / Blue is available", { exact: true })
         .last(),
     ).toBeVisible();
     await expect(
@@ -554,6 +562,192 @@ test("reconciliation UI resolves a lost simulated checkout response after restar
   } finally {
     await app?.close();
     await simulator.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("discovers products, selects a variant, creates a watch, pages history and exposes diagnostics and credential deletion", async () => {
+  const { startShopifyFixture } =
+    await import("../../packages/adapters/shopify/src/fixture");
+  const fixture = await startShopifyFixture();
+  fixture.state.catalogSize = 15;
+  fixture.state.image = {
+    url: "https://cdn.shopify.com/orbit-fixture.png",
+    altText: "Fixture shirt",
+  };
+  const dir = mkdtempSync(path.join(tmpdir(), "orbit-discovery-ui-"));
+  const app = await electron.launch({
+    args: ["dist/electron/main.cjs"],
+    env: { ...process.env, RETAIL_DATA_DIR: dir },
+  });
+  try {
+    const page = await app.firstWindow();
+    await page.route("https://cdn.shopify.com/orbit-fixture.png", (route) =>
+      route.fulfill({
+        contentType: "image/png",
+        body: Buffer.from(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=",
+          "base64",
+        ),
+      }),
+    );
+    await expect(
+      page.getByRole("heading", { name: "Workspace overview" }),
+    ).toBeVisible();
+    await page.evaluate(async (endpoint) => {
+      const data = await window.retail.configureIntegration({
+        retailerId: "shopify",
+        config: { endpoint },
+      });
+      return data.revision;
+    }, fixture.url);
+    await page.getByRole("button", { name: "Discover", exact: true }).click();
+    await page.getByLabel("Product search or identifier").fill("shirt");
+    await page
+      .getByRole("button", { name: "Search products", exact: true })
+      .click();
+    await expect(
+      page.getByRole("heading", { name: "Orbit fixture shirt", exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("img", { name: "Fixture shirt" }).first(),
+    ).toBeVisible();
+    await page
+      .getByRole("button", { name: "Next products", exact: true })
+      .click();
+    await expect(
+      page.getByRole("heading", {
+        name: "Orbit fixture shirt 13",
+        exact: true,
+      }),
+    ).toBeVisible();
+    fixture.state.latencyMs = 1000;
+    const before = fixture.metrics.queries;
+    await page.getByLabel("Product search or identifier").fill("shirt");
+    await page
+      .getByRole("button", { name: "Search products", exact: true })
+      .click();
+    await expect.poll(() => fixture.metrics.queries).toBeGreaterThan(before);
+    await page
+      .getByRole("button", { name: "Cancel discovery", exact: true })
+      .click();
+    fixture.state.latencyMs = 0;
+    await page.getByLabel("Product search or identifier").fill("orbit-shirt");
+    await page
+      .getByRole("button", { name: "Look up identifier", exact: true })
+      .click();
+    await expect(page.getByLabel("Monitoring variant")).toBeVisible();
+    await page
+      .getByLabel("Monitoring variant")
+      .selectOption("gid://shopify/ProductVariant/1");
+    await page.getByLabel("New monitoring group").fill("Discovered watches");
+    await page.getByLabel("Discovery monitoring interval (ms)").fill("100");
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.screenshot({
+      path: "test-results/discovery.png",
+      fullPage: true,
+    });
+    await page
+      .getByRole("button", { name: "Create monitoring task", exact: true })
+      .click();
+    await expect(
+      page.getByRole("heading", { name: "Inventory", exact: true }),
+    ).toBeVisible();
+    await page
+      .getByRole("button", {
+        name: "Start Orbit fixture shirt · Blue",
+        exact: true,
+      })
+      .click();
+    await expect(page.getByText("out-of-stock", { exact: true })).toBeVisible();
+    fixture.state.available = true;
+    await expect(page.getByText("in-stock", { exact: true })).toBeVisible();
+    await page.getByLabel("Search monitoring tasks").fill("no-match");
+    await expect(
+      page.getByRole("button", {
+        name: "Stop Orbit fixture shirt · Blue",
+        exact: true,
+      }),
+    ).toHaveCount(0);
+    await page.getByLabel("Search monitoring tasks").fill("shirt");
+    await expect(
+      page.getByRole("button", {
+        name: "Stop Orbit fixture shirt · Blue",
+        exact: true,
+      }),
+    ).toBeVisible();
+    await page.evaluate(async () => {
+      let data = await window.retail.command({
+        type: "saveGroup",
+        data: { name: "History pagination", retailer: "mock" },
+      });
+      const groupId = data.groups.find(
+        (group) => group.name === "History pagination",
+      )!.id;
+      for (let i = 0; i < 22; i++) {
+        data = await window.retail.command({
+          type: "saveTask",
+          data: {
+            name: `History ${i}`,
+            groupId,
+            product: "history-product",
+            workflow: "MONITOR_ONLY",
+            scenario: "out-of-stock",
+            intervalMs: 100,
+            maxRetries: 1,
+          },
+        });
+        await window.retail.command({
+          type: "start",
+          id: data.tasks.at(-1)!.id,
+        });
+      }
+    });
+    await expect
+      .poll(
+        async () =>
+          (await page.evaluate(() => window.retail.history({ limit: 100 })))
+            .items.length,
+      )
+      .toBeGreaterThan(20);
+    await page
+      .getByRole("button", { name: "Refresh history", exact: true })
+      .click();
+    await expect(page.getByText(/Page 1 · 20 observations/)).toBeVisible();
+    await page
+      .getByRole("button", { name: "Next history", exact: true })
+      .click();
+    await expect(page.getByText(/Page 2 · 20 observations/)).toBeVisible();
+    await page
+      .getByRole("button", { name: "Previous history", exact: true })
+      .click();
+    await expect(page.getByText(/Page 1 · 20 observations/)).toBeVisible();
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await expect(
+      page.getByRole("heading", { name: "Worker diagnostics", exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByText("Available", { exact: true }).first(),
+    ).toBeVisible();
+    await page
+      .getByRole("button", { name: "Delete credential", exact: true })
+      .click();
+    await expect(
+      page.getByText("Credential deleted; monitoring stopped", { exact: true }),
+    ).toBeVisible();
+    const data = await page.evaluate(() => window.retail.snapshot());
+    expect(
+      data.tasks.find((task) => task.name === "Orbit fixture shirt · Blue")
+        ?.state,
+    ).toBe("CANCELLED");
+    expect(data.inventory).toEqual([]);
+    expect(
+      (await page.evaluate(() => window.retail.history({ limit: 1 }))).items,
+    ).toHaveLength(1);
+    expect(fixture.metrics.mutations).toBe(0);
+  } finally {
+    await app.close();
+    await fixture.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -42,7 +42,7 @@ export const taskSchema = z
     workflow: z
       .enum(["MONITOR_ONLY", "MONITOR_AND_NOTIFY", "MONITOR_AND_CHECKOUT"])
       .default("MONITOR_AND_CHECKOUT"),
-    product: name,
+    product: z.string().trim().min(1).max(200),
     variantId: z.string().trim().min(1).max(120).nullable().default(null),
     profileId: id.nullable().default(null),
     proxyId: id.nullable().default(null),
@@ -114,6 +114,7 @@ export const settingsSchema = z
     logLevel: z.enum(["info", "debug"]),
     launchView: z.enum([
       "Dashboard",
+      "Discover",
       "Inventory",
       "Reconciliation",
       "Tasks",
@@ -164,7 +165,9 @@ export interface Snapshot {
     credentialConfigured: boolean;
     config: Record<string, unknown>;
   }[];
+  /** Deprecated: history is fetched through the paginated history endpoint. */
   inventory: InventoryRecord[];
+  monitoringHealth: MonitoringHealth[];
   latestInventory: InventoryRecord[];
   notices: InventoryNotice[];
   attempts: CheckoutAttempt[];
@@ -251,7 +254,7 @@ export const integrationInputSchema = z
   .object({
     retailerId: z.string().regex(/^[a-z0-9-]{1,60}$/),
     config: z.record(z.string(), z.unknown()),
-    credential: z.string().max(4096).optional(),
+    credential: z.string().trim().min(1).max(4096).optional(),
   })
   .strict();
 export type IntegrationInput = z.infer<typeof integrationInputSchema>;
@@ -260,5 +263,71 @@ export interface DesktopAPI {
   snapshot(): Promise<Snapshot>;
   command(command: Command): Promise<Snapshot>;
   configureIntegration(input: IntegrationInput): Promise<Snapshot>;
+  discover(
+    input: DiscoveryInput,
+  ): Promise<import("../../retailer-sdk/src/index").ProductPage>;
+  cancelDiscovery(requestId: string): Promise<void>;
+  history(input: HistoryInput): Promise<HistoryPage>;
+  diagnostics(): Promise<Diagnostics>;
+  credentialStatus(): Promise<CredentialStatus>;
+  deleteCredential(retailerId: string): Promise<Snapshot>;
   subscribe(callback: (snapshot: Snapshot) => void): () => void;
+}
+
+export const discoverySchema = z
+  .object({
+    requestId: z.string().uuid(),
+    retailerId: z.string().regex(/^[a-z0-9-]{1,60}$/),
+    mode: z.enum(["search", "lookup"]),
+    text: z.string().trim().min(1).max(200),
+    cursor: z.string().max(2000).nullable().default(null),
+    limit: z.number().int().min(1).max(50).default(12),
+  })
+  .strict();
+export type DiscoveryInput = z.input<typeof discoverySchema>;
+export const historySchema = z
+  .object({
+    taskId: z.string().uuid().optional(),
+    cursor: z.number().int().positive().optional(),
+    limit: z.number().int().min(1).max(100).default(20),
+  })
+  .strict();
+export type HistoryInput = z.input<typeof historySchema>;
+export interface HistoryPage {
+  items: InventoryRecord[];
+  nextCursor: number | null;
+  revision: number;
+}
+export interface MonitoringHealth {
+  taskId: string;
+  lastSuccess?: string;
+  lastError?: { at: string; code: string; message: string };
+}
+export interface Diagnostics {
+  workerAvailable: boolean;
+  sampledAt: string;
+  activeTasks: number;
+  activeOperations: number;
+  peakOperations: number;
+  queued: number;
+  subscriptions: number;
+  subscribers: number;
+  inventoryPolls: number;
+  workerHeapBytes: number;
+  database: {
+    available: boolean;
+    journalMode: unknown;
+    foreignKeys: unknown;
+    integrity?: string;
+  };
+  eventLatency: { samples: number; p50Ms: number; p95Ms: number };
+  recentErrors: { at: string; code: string; taskId?: string }[];
+}
+export interface CredentialStatus {
+  encryptionAvailable: boolean;
+  loadFailed: boolean;
+  entries: {
+    retailerId: string;
+    status: "available" | "missing" | "inaccessible";
+  }[];
 }

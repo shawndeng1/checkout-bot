@@ -85,6 +85,7 @@ export class SharedInventory {
       event: InventoryObservation,
       changed: boolean,
     ) => void = () => {},
+    private failed: (ids: string[], error: unknown) => void = () => {},
   ) {}
   get size() {
     return this.subscriptions.size;
@@ -226,6 +227,7 @@ export class SharedInventory {
           await delay(entry.task.intervalMs, signal);
         } catch (error) {
           if (signal.aborted) throw error;
+          this.failed([...entry.subscribers.keys()], error);
           if (
             !(error instanceof RetailerError) ||
             !error.retryable ||

@@ -1,6 +1,11 @@
 import { z } from "zod";
 export * from "./contracts";
-import type { OrderStatus, ProductDetails, ConfigField } from "./contracts";
+import type {
+  OrderStatus,
+  ProductDetails,
+  ConfigField,
+  ProductPage,
+} from "./contracts";
 import type { Task } from "../../shared-types/src/index";
 export interface ProductRef {
   productId: string;
@@ -16,6 +21,7 @@ export interface InventoryObservation {
   availability: "in-stock" | "out-of-stock" | "unknown";
   quantity?: number;
   expiresAt?: number;
+  details?: z.infer<typeof import("./contracts").observationDetailsSchema>;
 }
 export interface CartResult {
   sourceId?: string;
@@ -34,6 +40,7 @@ export interface AuthenticationRequirement {
   scopes: string[];
 }
 export interface RetailerCapabilities {
+  productSearch?: boolean;
   productLookup?: boolean;
   variants?: boolean;
   orderStatus?: boolean;
@@ -114,6 +121,12 @@ export interface RetailerAdapter {
     idempotencyKey: string,
     signal: AbortSignal,
   ): Promise<CheckoutResult>;
+  searchProducts?(
+    query: string,
+    cursor: string | null,
+    limit: number,
+    signal: AbortSignal,
+  ): Promise<ProductPage>;
   lookupProduct?(
     identifier: string,
     signal: AbortSignal,
@@ -151,6 +164,7 @@ export class AdapterRegistry {
       simulated: z.boolean(),
       sharedInventory: z.boolean(),
       productLookup: z.boolean().optional(),
+      productSearch: z.boolean().optional(),
       variants: z.boolean().optional(),
       orderStatus: z.boolean().optional(),
       authentication: z.array(
@@ -172,7 +186,14 @@ export class AdapterRegistry {
     )
       throw new Error("Real adapters must be inventory-only");
     if (
-      !["inventory", "cart", "checkout", "productLookup", "orderStatus"].some(
+      ![
+        "inventory",
+        "cart",
+        "checkout",
+        "productLookup",
+        "productSearch",
+        "orderStatus",
+      ].some(
         (key) =>
           definition.capabilities[key as keyof RetailerCapabilities] === true,
       )
@@ -216,6 +237,8 @@ export class AdapterRegistry {
         typeof adapter.submitCheckout !== "function") ||
       (adapter.capabilities.orderStatus &&
         typeof adapter.lookupOrder !== "function") ||
+      (adapter.capabilities.productSearch &&
+        typeof adapter.searchProducts !== "function") ||
       (adapter.capabilities.productLookup &&
         typeof adapter.lookupProduct !== "function")
     )

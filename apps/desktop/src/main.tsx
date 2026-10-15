@@ -35,9 +35,12 @@ import {
   ReconciliationView,
   IntegrationSettings,
 } from "./operations";
+import { DiscoveryView } from "./discovery";
+import { DiagnosticsPanel, BackendHealth } from "./diagnostics";
 import "./style.css";
 const views = [
   "Dashboard",
+  "Discover",
   "Inventory",
   "Reconciliation",
   "Tasks",
@@ -49,6 +52,7 @@ type View = (typeof views)[number];
 type FormKind = "Group" | "Task" | "Profile" | "Proxy";
 const icons = [
   LayoutDashboard,
+  Box,
   Activity,
   RefreshCw,
   Layers,
@@ -65,6 +69,7 @@ const activeStates = [
 ];
 function App() {
   const { data, error, setData, command, clearError } = useWorkspace();
+  const [backendAvailable, setBackendAvailable] = useState(true);
   const [view, setView] = useState<View>("Dashboard");
   const startupApplied = useRef(false);
   const lastNotification = useRef<string | null>(null);
@@ -159,6 +164,7 @@ function App() {
   };
   return (
     <div className="app-shell">
+      <BackendHealth onStatus={setBackendAvailable} />
       <aside className="sidebar">
         <div className="brand">
           <span className="brand-symbol">
@@ -208,7 +214,8 @@ function App() {
             Workspace <ChevronRight size={14} /> <strong>{view}</strong>
           </span>
           <div>
-            <span className="status-dot" /> Engine online{" "}
+            <span className="status-dot" />{" "}
+            {backendAvailable ? "Engine online" : "Backend unavailable"}{" "}
             <span className="top-divider" /> <span className="mono">LOCAL</span>
             <Bell size={17} />
           </div>
@@ -225,6 +232,8 @@ function App() {
                   {
                     Dashboard:
                       "A live view of your tasks, activity, and simulation performance.",
+                    Discover:
+                      "Find authorized products and choose variants to monitor.",
                     Inventory:
                       "Continuous product and variant observations, with availability alerts.",
                     Reconciliation:
@@ -240,7 +249,9 @@ function App() {
                 }
               </p>
             </div>
-            {!["Settings", "Inventory", "Reconciliation"].includes(view) && (
+            {!["Settings", "Inventory", "Reconciliation", "Discover"].includes(
+              view,
+            ) && (
               <Button
                 variant="primary"
                 onClick={() =>
@@ -269,6 +280,12 @@ function App() {
             <div className="alert" role="alert">
               A checkout outcome is unknown. Automatic retries are blocked; open
               Reconciliation to check the order status.
+            </div>
+          )}
+          {!backendAvailable && (
+            <div className="alert" role="alert">
+              Backend unavailable. Restart Orbit to recover safely; new
+              operations are blocked.
             </div>
           )}
           {error && (
@@ -402,6 +419,12 @@ function App() {
                     )}
                   </section>
                 </>
+              )}
+              {view === "Discover" && (
+                <DiscoveryView
+                  data={data}
+                  onCreated={() => navigate("Inventory")}
+                />
               )}
               {view === "Inventory" && (
                 <InventoryView data={data} command={command} />
@@ -821,6 +844,7 @@ function App() {
                 <>
                   <SettingsForm data={data} save={command} />
                   <IntegrationSettings data={data} />
+                  <DiagnosticsPanel />
                 </>
               )}
             </>

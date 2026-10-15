@@ -334,3 +334,49 @@ it("backs up schema v2 and preserves approval, attempt, revision and legacy task
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+it("migrates schema v3 with observation data in place and backfills monitoring health", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "orbit-v3-")),
+    path = join(dir, "db.sqlite");
+  try {
+    let store = await Store.open(path);
+    const groupId = store.saveGroup({ name: "Preserved v3", retailer: "mock" });
+    const id = store.saveTask({
+      name: "Preserved",
+      groupId,
+      product: "x",
+      workflow: "MONITOR_ONLY",
+      scenario: "available",
+      intervalMs: 100,
+      maxRetries: 1,
+    });
+    store.begin(id);
+    store.recordInventory([id], {
+      eventId: "one",
+      streamId: "source",
+      retailerId: "mock",
+      product: { productId: "x" },
+      sequence: 1,
+      observedAt: Date.now(),
+      availability: "out-of-stock",
+    });
+    const event = store.inventoryHistory().items[0];
+    store.close();
+    const legacy = new DatabaseSync(path);
+    legacy.exec(
+      "DROP TABLE monitoring_health; DELETE FROM migrations WHERE version=4",
+    );
+    legacy.close();
+    store = await Store.open(path);
+    expect(store.inventoryHistory().items[0]).toEqual(event);
+    expect(store.task(id).workflow).toBe("MONITOR_ONLY");
+    expect(store.snapshot().monitoringHealth[0].lastSuccess).toBe(
+      event.receivedAt,
+    );
+    expect(existsSync(path + ".v3.bak")).toBe(true);
+    expect(store.snapshot().inventory).toEqual([]);
+    store.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
