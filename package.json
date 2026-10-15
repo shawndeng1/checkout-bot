@@ -11,11 +11,12 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:e2e": "pnpm build && playwright test",
-    "format": "prettier --write apps packages scripts tests docs *.md *.ts *.json *.yaml",
-    "format:check": "prettier --check apps packages scripts tests docs *.md *.ts *.json *.yaml",
+    "format": "prettier --write .github apps packages scripts tests docs *.md *.ts *.json *.yaml",
+    "format:check": "prettier --check .github apps packages scripts tests docs *.md *.ts *.json *.yaml",
     "simulator": "node scripts/simulator.mjs",
     "benchmark": "node scripts/benchmark.mjs",
-    "fixture:shopify": "node scripts/shopify-fixture.mjs"
+    "fixture:shopify": "node scripts/shopify-fixture.mjs",
+    "test:pilot": "vitest run tests/shopify-live.test.ts"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",

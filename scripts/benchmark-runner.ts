@@ -1,3 +1,5 @@
+import { fork } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import {
   mkdtempSync,
   rmSync,
@@ -39,6 +41,7 @@ async function measure(count: number, workerPath: string) {
         type: "saveTask",
         data: {
           name: `Monitor ${i}`,
+          workflow: "MONITOR_ONLY",
           groupId,
           product: "SKU-42",
           variantId: null,
@@ -86,11 +89,11 @@ async function measure(count: number, workerPath: string) {
     });
     if (!control.ok) throw new Error("Control update failed");
     const deadline = performance.now() + 15000;
-    while (!latest.tasks.every((task) => task.state === "AWAITING_APPROVAL")) {
+    while (!latest.tasks.every((task) => task.state === "STOCK_DETECTED")) {
       if (performance.now() > deadline) throw new Error("Benchmark timed out");
       await sleep(10);
     }
-    const approvalLatency = performance.now() - changedPerf;
+    const stockVisibleLatency = performance.now() - changedPerf;
     const finalMetrics = await backend.metrics();
     const latencies = [...stockTimes.values()]
       .map((at) => Math.max(0, at - changedAt))
@@ -99,6 +102,7 @@ async function measure(count: number, workerPath: string) {
       throw new Error("Missing stock event measurements");
     const result = {
       tasks: count,
+      processId: process.pid,
       sharedSubscriptions: metrics.subscriptions,
       monitoringPolls: metrics.inventoryPolls,
       monitoringWindowMs: round(monitorMs),
@@ -109,10 +113,11 @@ async function measure(count: number, workerPath: string) {
       rssBaselineMiB: round(rssBaseline / 2 ** 20),
       peakProcessRssMiB: round(peakRss / 2 ** 20),
       workerHeapMiB: round(metrics.workerHeapBytes / 2 ** 20),
+      rawLatenciesMs: latencies,
       stockLatencyP50Ms: percentile(latencies, 0.5),
       stockLatencyP95Ms: percentile(latencies, 0.95),
       stockLatencyMaxMs: Math.max(...latencies),
-      allApprovalReadyMs: round(approvalLatency),
+      allStockVisibleMs: round(stockVisibleLatency),
       totalWorkloadMs: round(performance.now() - started),
       peakOperations: finalMetrics.peakOperations,
       ordersCreated: server.metrics.ordersCreated,
@@ -121,7 +126,7 @@ async function measure(count: number, workerPath: string) {
     if (
       result.peakOperations > 10 ||
       result.ordersCreated !== 0 ||
-      finalMetrics.subscriptions !== 0
+      finalMetrics.subscriptions !== 1
     )
       throw new Error("Safety or capacity assertion failed");
     return result;
@@ -134,13 +139,85 @@ async function measure(count: number, workerPath: string) {
     rmSync(dir, { recursive: true, force: true });
   }
 }
+async function isolatedTrial(
+  count: number,
+  workerPath: string,
+): Promise<Awaited<ReturnType<typeof measure>>> {
+  return new Promise((resolve, reject) => {
+    const child = fork(
+      fileURLToPath(import.meta.url),
+      ["--trial", String(count), workerPath],
+      { stdio: ["ignore", "inherit", "inherit", "ipc"] },
+    );
+    let result: Awaited<ReturnType<typeof measure>> | undefined;
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("Benchmark trial timed out"));
+    }, 30000);
+    child.on("message", (message) => {
+      result = message as typeof result;
+    });
+    child.on("error", () => {
+      clearTimeout(timeout);
+      reject(new Error("Benchmark trial failed to launch"));
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timeout);
+      if (code === 0 && result) resolve(result);
+      else reject(new Error("Benchmark trial failed"));
+    });
+  });
+}
+if (process.argv[2] === "--trial")
+  void measure(Number(process.argv[3]), process.argv[4])
+    .then((result) => {
+      process.send?.(result);
+      process.disconnect?.();
+    })
+    .catch(() => {
+      process.exitCode = 1;
+      process.disconnect?.();
+    });
 export async function runBenchmarks(workerPath: string) {
-  const results = [];
-  for (const count of [10, 50, 100]) {
-    const result = await measure(count, workerPath);
-    results.push(result);
-    console.log(JSON.stringify(result));
-  }
+  const iterations = Number(process.env.ORBIT_BENCHMARK_ITERATIONS ?? 3);
+  if (!Number.isInteger(iterations) || iterations < 2 || iterations > 20)
+    throw new Error("Use 2–20 benchmark iterations");
+  const results: (Awaited<ReturnType<typeof measure>> & {
+    iteration: number;
+  })[] = [];
+  for (let iteration = 1; iteration <= iterations; iteration++)
+    for (const count of [10, 50, 100]) {
+      const result = { iteration, ...(await isolatedTrial(count, workerPath)) };
+      results.push(result);
+      console.log(JSON.stringify(result));
+    }
+  const summary = [10, 50, 100].map((tasks) => {
+    const samples = results.filter((result) => result.tasks === tasks);
+    const latencies = samples
+      .flatMap((sample) => sample.rawLatenciesMs)
+      .sort((a, b) => a - b);
+    const cpu = samples
+      .map((sample) => sample.monitoringCpuPercentOneCore)
+      .sort((a, b) => a - b);
+    return {
+      tasks,
+      iterations: samples.length,
+      latencySamples: latencies.length,
+      p50Ms: percentile(latencies, 0.5),
+      p95Ms: percentile(latencies, 0.95),
+      cpuP50PercentOneCore: percentile(cpu, 0.5),
+      cpuP95PercentOneCore: percentile(cpu, 0.95),
+      peakRssMiB: Math.max(
+        ...samples.map((sample) => sample.peakProcessRssMiB),
+      ),
+      workerHeapP50MiB: percentile(
+        samples.map((sample) => sample.workerHeapMiB).sort((a, b) => a - b),
+        0.5,
+      ),
+    };
+  });
+  const methodology =
+    "Each trial runs in a fresh child process with a fresh backend worker and in-memory loopback HTTP simulator, with temporary on-disk desktop SQLite/WAL. Trials run sequentially; process IDs are recorded to verify isolation, avoiding parent allocator/JIT retention across scales. Continuous MONITOR_ONLY tasks share one product/default-variant subscription; interval 100 ms, concurrency 10, simulator policy 10 ms / 4 requests. After all task starts, warm up 500 ms, then sample steady monitoring CPU for 2000 ms. CPU includes the measured trial process, its worker and simulator (not the orchestrator) and is normalized to one core. RSS is whole trial-process memory sampled every 10 ms from steady monitoring through stock snapshot receipt; worker heap is sampled before stock. Task latencies use persisted STOCK_DETECTED log timestamps minus the local inventory-change request send time. Pooled latency samples are correlated within each shared fan-out, not independent network samples. Per-scale p50/p95 are nearest-rank across pooled task events; CPU p50/p95 use trial-window percentages. Peak RSS is the maximum over trials. Full-snapshot IPC is included in overall readiness, not log-timestamp latency. Sources remain subscribed after stock and are cancelled on shutdown. Every trial verifies sharing, subscriber count, capacity and zero orders. These fixture measurements do not establish production Shopify, GUI rendering, cross-platform performance or an improvement over a differently defined historical workload.";
   const report = {
     recordedAt: new Date().toISOString(),
     runtime: process.version,
@@ -148,23 +225,24 @@ export async function runBenchmarks(workerPath: string) {
     arch: arch(),
     cpu: cpus()[0]?.model,
     logicalCpus: cpus().length,
-    methodology:
-      "One fresh backend worker and one parent-process loopback simulator per scale, run sequentially in a single parent process; RSS can include parent allocator/JIT retention from earlier cases. Concurrency 10; shared inventory poll interval 100ms; simulator policy 10ms minimum request spacing / 4 concurrent requests. 500ms warm-up then 2000ms steady out-of-stock CPU sample. CPU is process CPU including worker and simulator, expressed against one core. RSS is total process memory (parent + worker + simulator), sampled every 10ms from steady-state through approval readiness; worker heap sampled before stock. Stock latency uses persisted STOCK_DETECTED event timestamps relative to sending the local inventory change; allApprovalReady includes cart queueing plus snapshot IPC. No approvals or order submissions are sent. One sample per scale, no baseline or statistical regression claim.",
+    iterations,
+    methodology,
+    summary,
     results,
   };
   mkdirSync("docs/benchmarks", { recursive: true });
   writeFileSync(
-    "docs/benchmarks/milestone-2.json",
+    "docs/benchmarks/milestone-4.json",
     JSON.stringify(report, null, 2) + "\n",
   );
-  const rows = results
+  const rows = summary
     .map(
-      (r) =>
-        `| ${r.tasks} | ${r.monitoringPolls} | ${r.stockLatencyP50Ms} / ${r.stockLatencyP95Ms} / ${r.stockLatencyMaxMs} | ${r.allApprovalReadyMs} | ${r.monitoringCpuMs} / ${r.monitoringCpuPercentOneCore}% | ${r.peakProcessRssMiB} | ${r.workerHeapMiB} |`,
+      (row) =>
+        `| ${row.tasks} | ${row.iterations} / ${row.latencySamples} | ${row.p50Ms} / ${row.p95Ms} | ${row.cpuP50PercentOneCore}% / ${row.cpuP95PercentOneCore}% | ${row.peakRssMiB} | ${row.workerHeapP50MiB} |`,
     )
     .join("\n");
   writeFileSync(
-    "docs/benchmarks/MILESTONE_2.md",
-    `# Milestone 2 measured monitoring benchmark\n\nRuntime: ${report.runtime}; ${report.platform}/${report.arch}; ${report.cpu}; ${report.logicalCpus} logical CPUs.\n\n| Tasks | Polls before stock | Stock latency p50 / p95 / max (ms) | All carts awaiting approval (ms) | Steady monitoring CPU ms / one-core % | Peak process RSS (MiB) | Worker heap (MiB) |\n| --- | --- | --- | --- | --- | --- | --- |\n${rows}\n\n${report.methodology}\n\nAll runs verified one shared subscription, correct subscriber counts, cleanup after stock fan-out, configured capacity bounds, and zero simulated orders. Raw measurements: [milestone-2.json](milestone-2.json). Rerun with \`pnpm benchmark\`. These measurements characterize this local workload; they do not establish cross-platform performance or an improvement over an unmeasured baseline.\n`,
+    "PERFORMANCE.md",
+    `# Milestone 4 measured inventory performance\n\nRecorded ${report.recordedAt}; ${report.runtime}; ${report.platform}/${report.arch}; ${report.cpu}.\n\n| Tasks | Trials / task-event samples | Stock p50 / p95 ms | CPU p50 / p95 one-core | Peak RSS MiB | Median worker heap MiB |\n| --- | --- | --- | --- | --- | --- |\n${rows}\n\n${methodology}\n\nRaw per-trial measurements and task latencies: [milestone-4.json](docs/benchmarks/milestone-4.json). Run with Node 24.15+ using \`pnpm benchmark\`; \`ORBIT_BENCHMARK_ITERATIONS\` defaults to 3 (minimum 2). Historical [Milestone 2 samples](docs/benchmarks/MILESTONE_2.md) used a different checkout workflow and single samples; they are not a controlled regression baseline.\n`,
   );
 }
