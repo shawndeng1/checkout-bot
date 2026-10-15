@@ -16,9 +16,6 @@ importers:
       react-dom:
         specifier: ^19.2.0
         version: 19.3.0(react@19.3.0)
-      sql.js:
-        specifier: ^1.13.0
-        version: 1.14.2
       zod:
         specifier: ^4.1.12
         version: 4.6.7
@@ -56,6 +53,9 @@ importers:
       prettier:
         specifier: ^3.9.10
         version: 3.9.10
+      sql.js:
+        specifier: ^1.13.0
+        version: 1.14.2
       tailwindcss:
         specifier: ^4.1.14
         version: 4.3.3
@@ -71,6 +71,10 @@ importers:
 
   apps/desktop: {}
 
+  packages/adapters: {}
+
+  packages/adapters/http: {}
+
   packages/adapters/mock: {}
 
   packages/core: {}
@@ -80,6 +84,8 @@ importers:
   packages/retailer-sdk: {}
 
   packages/shared-types: {}
+
+  packages/simulator: {}
 
   packages/ui: {}
 

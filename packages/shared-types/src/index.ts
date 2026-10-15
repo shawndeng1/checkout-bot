@@ -14,7 +14,11 @@ export type TaskState = (typeof states)[number];
 const name = z.string().trim().min(1).max(120);
 const id = z.string().uuid();
 export const groupSchema = z
-  .object({ id: id.optional(), name, retailer: z.literal("mock") })
+  .object({
+    id: id.optional(),
+    name,
+    retailer: z.string().regex(/^[a-z0-9-]{1,60}$/),
+  })
   .strict();
 export const scenarios = [
   "available",
@@ -29,6 +33,7 @@ export const taskSchema = z
     groupId: id,
     name,
     product: name,
+    variantId: z.string().trim().min(1).max(120).nullable().default(null),
     profileId: id.nullable().default(null),
     proxyId: id.nullable().default(null),
     scenario: z.enum(scenarios),
