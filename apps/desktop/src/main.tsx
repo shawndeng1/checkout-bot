@@ -30,9 +30,16 @@ import {
   type Command,
   type Snapshot,
 } from "../../../packages/shared-types/src/index";
+import {
+  InventoryView,
+  ReconciliationView,
+  IntegrationSettings,
+} from "./operations";
 import "./style.css";
 const views = [
   "Dashboard",
+  "Inventory",
+  "Reconciliation",
   "Tasks",
   "Profiles",
   "Proxies",
@@ -40,7 +47,15 @@ const views = [
 ] as const;
 type View = (typeof views)[number];
 type FormKind = "Group" | "Task" | "Profile" | "Proxy";
-const icons = [LayoutDashboard, Layers, Users, Globe, SettingsIcon];
+const icons = [
+  LayoutDashboard,
+  Activity,
+  RefreshCw,
+  Layers,
+  Users,
+  Globe,
+  SettingsIcon,
+];
 const activeStates = [
   "MONITORING",
   "STOCK_DETECTED",
@@ -53,6 +68,7 @@ function App() {
   const [view, setView] = useState<View>("Dashboard");
   const startupApplied = useRef(false);
   const lastNotification = useRef<string | null>(null);
+  const lastInventoryNotice = useRef<string | null>(null);
   const [group, setGroup] = useState<string>("all");
   const [selected, setSelected] = useState<string[]>([]);
   const [logs, setLogs] = useState<string | null>(null);
@@ -71,6 +87,14 @@ function App() {
     let disposed = false;
     const unsubscribe = window.retail.subscribe((snapshot) => {
       setData(snapshot);
+      const inventoryNotice = snapshot.notices[0];
+      if (
+        inventoryNotice &&
+        inventoryNotice.id !== lastInventoryNotice.current &&
+        snapshot.settings.inventoryNotifications
+      )
+        setNotice(inventoryNotice.message);
+      lastInventoryNotice.current = inventoryNotice?.id ?? null;
       const latest = snapshot.logs[0];
       if (
         snapshot.settings.notifications &&
@@ -86,6 +110,7 @@ function App() {
         if (disposed) return;
         setData(snapshot);
         lastNotification.current = snapshot.logs[0]?.id ?? null;
+        lastInventoryNotice.current = snapshot.notices[0]?.id ?? null;
         if (!startupApplied.current) {
           setView(snapshot.settings.launchView);
           startupApplied.current = true;
@@ -162,11 +187,11 @@ function App() {
         </nav>
         <div className="sidebar-bottom">
           <div className="sandbox-card">
-            <span className="status-dot" /> Simulation environment
+            <span className="status-dot" /> Inventory & simulation
             <p>
-              Mock retailer connected.
+              Inventory monitoring.
               <br />
-              No real purchases.
+              Simulated checkout only.
             </p>
           </div>
           <div className="user">
@@ -200,6 +225,10 @@ function App() {
                   {
                     Dashboard:
                       "A live view of your tasks, activity, and simulation performance.",
+                    Inventory:
+                      "Continuous product and variant observations, with availability alerts.",
+                    Reconciliation:
+                      "Check uncertain simulated orders without submitting another checkout.",
                     Tasks:
                       "Organize, monitor, and manage your retailer workflows.",
                     Profiles:
@@ -211,7 +240,7 @@ function App() {
                 }
               </p>
             </div>
-            {view !== "Settings" && (
+            {!["Settings", "Inventory", "Reconciliation"].includes(view) && (
               <Button
                 variant="primary"
                 onClick={() =>
@@ -238,8 +267,8 @@ function App() {
           </div>
           {data?.tasks.some((task) => task.state === "UNKNOWN_OUTCOME") && (
             <div className="alert" role="alert">
-              A checkout outcome is unknown. Automatic retries are blocked;
-              reconcile the attempt before taking further action.
+              A checkout outcome is unknown. Automatic retries are blocked; open
+              Reconciliation to check the order status.
             </div>
           )}
           {error && (
@@ -373,6 +402,12 @@ function App() {
                     )}
                   </section>
                 </>
+              )}
+              {view === "Inventory" && (
+                <InventoryView data={data} command={command} />
+              )}
+              {view === "Reconciliation" && (
+                <ReconciliationView data={data} command={command} />
               )}
               {view === "Tasks" && (
                 <>
@@ -783,7 +818,10 @@ function App() {
                 </section>
               )}
               {view === "Settings" && (
-                <SettingsForm data={data} save={command} />
+                <>
+                  <SettingsForm data={data} save={command} />
+                  <IntegrationSettings data={data} />
+                </>
               )}
             </>
           )}
@@ -792,7 +830,8 @@ function App() {
               <span className="status-dot" /> All changes saved locally
             </span>
             <span>
-              ORBIT WORKSPACE <span className="muted">/</span> SIMULATION MODE
+              ORBIT WORKSPACE <span className="muted">/</span> SIMULATED
+              CHECKOUT
             </span>
           </footer>
         </main>
@@ -914,6 +953,16 @@ function EntityForm({
     Group: { name: "", retailer: "mock" },
     Task: {
       name: "",
+      workflow:
+        data.retailers.find(
+          (r) =>
+            r.id ===
+            data.groups.find(
+              (g) => g.id === (group !== "all" ? group : data.groups[0]?.id),
+            )?.retailer,
+        )?.capabilities.checkout === false
+          ? "MONITOR_AND_NOTIFY"
+          : "MONITOR_AND_CHECKOUT",
       product: "",
       variantId: "",
       groupId: group !== "all" ? group : (data.groups[0]?.id ?? ""),
@@ -963,12 +1012,26 @@ function EntityForm({
         label: "Retailer",
         options: data.retailers.map((r) => ({
           value: r.id,
-          label: r.name + " · Simulation",
+          label:
+            r.name +
+            (r.capabilities.simulated ? " · Simulation" : " · Inventory only"),
         })),
       },
     ],
     Task: [
       { key: "name", label: "Task name" },
+      {
+        key: "workflow",
+        label: "Workflow",
+        options: [
+          { value: "MONITOR_ONLY", label: "Monitor continuously" },
+          { value: "MONITOR_AND_NOTIFY", label: "Monitor and notify" },
+          {
+            value: "MONITOR_AND_CHECKOUT",
+            label: "Monitor and simulated checkout",
+          },
+        ],
+      },
       { key: "product", label: "Product identifier" },
       { key: "variantId", label: "Variant identifier (optional)" },
       {
@@ -1062,7 +1125,7 @@ function EntityForm({
         </div>
         <p className="form-description">
           {kind === "Task"
-            ? "Run a deterministic mock workflow. Simulated checkout requires your approval."
+            ? "Monitor continuously or run an approved simulated checkout. Configure inventory integrations in Settings."
             : kind === "Profile"
               ? "Only contact details and placeholder payment tokens are accepted."
               : kind === "Proxy"
@@ -1081,7 +1144,19 @@ function EntityForm({
                   aria-label={field.label}
                   value={String(value[field.key] ?? "")}
                   onChange={(e) =>
-                    setValue({ ...value, [field.key]: e.target.value })
+                    setValue({
+                      ...value,
+                      [field.key]: e.target.value,
+                      ...(field.key === "groupId" &&
+                      !data.retailers.find(
+                        (r) =>
+                          r.id ===
+                          data.groups.find((g) => g.id === e.target.value)
+                            ?.retailer,
+                      )?.capabilities.checkout
+                        ? { workflow: "MONITOR_AND_NOTIFY" }
+                        : {}),
+                    })
                   }
                   required={!["profileId", "proxyId"].includes(field.key)}
                 >
@@ -1230,6 +1305,35 @@ function SettingsForm({
           }
         />
       </div>
+      {(
+        [
+          [
+            "inventoryNotifications",
+            "Inventory notifications",
+            "Show in-app alerts for monitor-and-notify tasks.",
+          ],
+          [
+            "nativeNotifications",
+            "Native desktop notifications",
+            "Also send inventory alerts through the operating system.",
+          ],
+        ] as const
+      ).map(([key, label, description]) => (
+        <div className="setting-row" key={key}>
+          <div>
+            <strong>{label}</strong>
+            <p>{description}</p>
+          </div>
+          <input
+            aria-label={label}
+            type="checkbox"
+            checked={settings[key]}
+            onChange={(e) =>
+              setSettings({ ...settings, [key]: e.target.checked })
+            }
+          />
+        </div>
+      ))}
       <div className="setting-row">
         <div>
           <strong>Logging detail</strong>

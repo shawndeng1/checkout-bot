@@ -856,3 +856,32 @@ select {
     padding: 0 22px;
   }
 }
+
+.operations-stack {
+  display: grid;
+  gap: 20px;
+}
+.integration-settings {
+  margin-top: 24px;
+}
+.detail-grid {
+  display: grid;
+  grid-template-columns: 180px minmax(0, 1fr);
+  gap: 12px;
+  padding: 0 24px 16px;
+  font-size: 13px;
+}
+.detail-grid dt {
+  color: var(--muted, #9094a5);
+}
+.detail-grid dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.operations-stack .activity-row p {
+  overflow-wrap: anywhere;
+}
+.operations-stack table td {
+  max-width: 290px;
+  overflow-wrap: anywhere;
+}

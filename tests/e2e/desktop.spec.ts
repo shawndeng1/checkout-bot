@@ -364,3 +364,196 @@ test("registers the local HTTP adapter and completes a variant workflow through 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("inventory-only integration configuration, continuous variant monitoring, notifications and restart", async () => {
+  const { startShopifyFixture } =
+    await import("../../packages/adapters/shopify/src/fixture");
+  const fixture = await startShopifyFixture();
+  const dir = mkdtempSync(path.join(tmpdir(), "orbit-inventory-ui-"));
+  let app: ElectronApplication | undefined;
+  const launch = () =>
+    electron.launch({
+      args: ["dist/electron/main.cjs"],
+      env: { ...process.env, RETAIL_DATA_DIR: dir },
+    });
+  try {
+    app = await launch();
+    let page = await app.firstWindow();
+    await expect(
+      page.getByRole("heading", { name: "Workspace overview" }),
+    ).toBeVisible();
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await page.getByLabel("Store / fixture origin").fill(fixture.url);
+    await page.getByRole("button", { name: "Save integration" }).click();
+    await expect(
+      page.getByText("Integration saved", { exact: true }),
+    ).toBeVisible();
+    await page.getByLabel("Resume interrupted monitoring").check();
+    await page.getByRole("button", { name: "Save preferences" }).click();
+    await page
+      .getByRole("button", { name: "Tasks", exact: false })
+      .first()
+      .click();
+    await page.getByRole("button", { name: "New group", exact: true }).click();
+    await page.getByLabel("Group name").fill("Fixture watches");
+    await page.getByLabel("Retailer", { exact: true }).selectOption("shopify");
+    await page.getByRole("button", { name: "Save group" }).click();
+    await page.getByRole("button", { name: "New task", exact: true }).click();
+    await page.getByLabel("Task name").fill("Blue shirt");
+    await page
+      .getByLabel("Product identifier", { exact: true })
+      .fill("orbit-shirt");
+    await page
+      .getByLabel("Variant identifier")
+      .fill("gid://shopify/ProductVariant/1");
+    await page
+      .getByLabel("Workflow", { exact: true })
+      .selectOption("MONITOR_AND_NOTIFY");
+    await page.getByLabel("Monitor interval").fill("100");
+    await page.getByRole("button", { name: "Save task" }).click();
+    await page
+      .getByRole("button", { name: "Start Blue shirt", exact: true })
+      .click();
+    await page.getByRole("button", { name: "Inventory", exact: true }).click();
+    await expect(page.getByText("out-of-stock", { exact: true })).toBeVisible();
+    fixture.state.available = true;
+    await expect(page.getByText("in-stock", { exact: true })).toBeVisible();
+    await expect(
+      page.getByRole("heading", {
+        name: "Inventory notifications",
+        exact: true,
+      }),
+    ).toBeVisible();
+    await expect(
+      page
+        .getByText(
+          "orbit-shirt / gid://shopify/ProductVariant/1 is available",
+          { exact: true },
+        )
+        .last(),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Stop Blue shirt", exact: true }),
+    ).toBeVisible();
+    const data = await page.evaluate(() => window.retail.snapshot());
+    expect(data.notices).toHaveLength(1);
+    expect(data.attempts).toEqual([]);
+    await page.screenshot({
+      path: "test-results/inventory.png",
+      fullPage: true,
+    });
+    await app.close();
+    app = await launch();
+    page = await app.firstWindow();
+    await expect(
+      page.getByRole("heading", { name: "Workspace overview" }),
+    ).toBeVisible();
+    await page.getByRole("button", { name: "Inventory", exact: true }).click();
+    await expect(page.getByText("in-stock", { exact: true })).toBeVisible();
+    await page
+      .getByRole("button", { name: "Stop Blue shirt", exact: true })
+      .click();
+    await expect(
+      page.getByRole("button", { name: "Start Blue shirt", exact: true }),
+    ).toBeVisible();
+    expect(fixture.metrics.mutations).toBe(0);
+  } finally {
+    await app?.close();
+    await fixture.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("reconciliation UI resolves a lost simulated checkout response after restart without resubmission", async () => {
+  const { startSimulator } = await import("../../packages/simulator/src/index");
+  const simulator = await startSimulator();
+  const dir = mkdtempSync(path.join(tmpdir(), "orbit-reconcile-ui-"));
+  let app: ElectronApplication | undefined;
+  const launch = () =>
+    electron.launch({
+      args: ["dist/electron/main.cjs"],
+      env: {
+        ...process.env,
+        RETAIL_DATA_DIR: dir,
+        ORBIT_SIMULATOR_URL: simulator.url,
+      },
+    });
+  try {
+    app = await launch();
+    let page = await app.firstWindow();
+    await expect(
+      page.getByRole("heading", { name: "Workspace overview" }),
+    ).toBeVisible();
+    await page.evaluate(async () => {
+      let data = await window.retail.command({
+        type: "saveGroup",
+        data: { name: "Uncertain", retailer: "simulator" },
+      });
+      data = await window.retail.command({
+        type: "saveTask",
+        data: {
+          name: "Lost response",
+          product: "SKU-42",
+          variantId: "blue",
+          groupId: data.groups[0].id,
+          scenario: "available",
+          intervalMs: 100,
+          maxRetries: 1,
+        },
+      });
+      await window.retail.command({ type: "start", id: data.tasks[0].id });
+    });
+    await page
+      .getByRole("button", { name: "Tasks", exact: false })
+      .first()
+      .click();
+    await expect(
+      page.getByRole("button", { name: "Approve", exact: true }),
+    ).toBeVisible();
+    await fetch(simulator.url + "/control/config", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${simulator.token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ dropCheckoutResponse: true }),
+    });
+    await page.getByRole("button", { name: "Approve", exact: true }).click();
+    await expect(
+      page.getByText("unknown outcome", { exact: true }),
+    ).toBeVisible();
+    await app.close();
+    app = await launch();
+    page = await app.firstWindow();
+    await expect(
+      page.getByRole("heading", { name: "Workspace overview" }),
+    ).toBeVisible();
+    await page
+      .getByRole("button", { name: "Reconciliation", exact: true })
+      .click();
+    await expect(
+      page.getByRole("heading", { name: "Lost response", exact: true }),
+    ).toBeVisible();
+    await expect(page.getByText("Submitted", { exact: true })).toBeVisible();
+    await page
+      .getByRole("button", { name: "Check Order Status", exact: true })
+      .click();
+    await expect(
+      page.getByText("completed", { exact: true }).first(),
+    ).toBeVisible();
+    await expect(page.getByText(/Confirmed order/)).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Check Order Status", exact: true }),
+    ).toBeDisabled();
+    await page.screenshot({
+      path: "test-results/reconciliation.png",
+      fullPage: true,
+    });
+    expect(simulator.metrics.checkoutRequests).toBe(1);
+    expect(simulator.metrics.ordersCreated).toBe(1);
+  } finally {
+    await app?.close();
+    await simulator.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

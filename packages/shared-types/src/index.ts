@@ -114,6 +114,8 @@ export const settingsSchema = z
     logLevel: z.enum(["info", "debug"]),
     launchView: z.enum([
       "Dashboard",
+      "Inventory",
+      "Reconciliation",
       "Tasks",
       "Profiles",
       "Proxies",
