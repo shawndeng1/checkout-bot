@@ -1,8 +1,18 @@
-import { app, BrowserWindow, ipcMain } from "electron";
+import {
+  app,
+  BrowserWindow,
+  ipcMain,
+  safeStorage,
+  Notification,
+} from "electron";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { BackendClient } from "./backend-client";
-import { commandSchema } from "../../../packages/shared-types/src/index";
+import { CredentialVault } from "./credential-vault";
+import {
+  commandSchema,
+  integrationInputSchema,
+} from "../../../packages/shared-types/src/index";
 import { ZodError } from "zod";
 app.setName("OrbitRetail");
 let engine: BackendClient;
@@ -18,18 +28,54 @@ else {
   app
     .whenReady()
     .then(async () => {
+      const vault = new CredentialVault(
+        path.join(
+          process.env.RETAIL_DATA_DIR || app.getPath("userData"),
+          "credentials.enc.json",
+        ),
+        safeStorage,
+      );
+      let credentials: Record<string, string> = {};
+      try {
+        credentials = await vault.load();
+      } catch {
+        console.error(
+          "Credential store unavailable; inventory integration requires reconfiguration",
+        );
+      }
       engine = new BackendClient(
         path.join(__dirname, "backend-worker.cjs"),
         path.join(
           process.env.RETAIL_DATA_DIR || app.getPath("userData"),
           "retail.sqlite",
         ),
+        credentials,
       );
       engine.on("failure", (error) => {
         console.error("Backend unavailable", error);
         app.exit(1);
       });
+      engine.on("native-notification", (notice) => {
+        if (Notification.isSupported())
+          try {
+            new Notification({
+              title: "Orbit inventory",
+              body: notice.message,
+            }).show();
+          } catch {
+            /* In-app history remains available. */
+          }
+      });
       await engine.ready;
+      let operations = Promise.resolve();
+      const serialize = <T>(action: () => Promise<T>): Promise<T> => {
+        const next = operations.then(action);
+        operations = next.then(
+          () => {},
+          () => {},
+        );
+        return next;
+      };
       const renderer = pathToFileURL(
         path.join(__dirname, "../renderer/index.html"),
       ).href;
@@ -54,7 +100,10 @@ else {
       ipcMain.handle("retail:command", async (event, input) => {
         trusted(event);
         try {
-          return await engine.command(commandSchema.parse(input));
+          const parsed = commandSchema.parse(input);
+          return parsed.type === "reconcile"
+            ? await engine.command(parsed)
+            : await serialize(() => engine.command(parsed));
         } catch (error) {
           if (error instanceof ZodError)
             throw new Error(
@@ -64,6 +113,27 @@ else {
             );
           throw error;
         }
+      });
+      ipcMain.handle("retail:configure", (event, input) => {
+        trusted(event);
+        const parsed = integrationInputSchema.parse(input);
+        return serialize(async () => {
+          await engine.configureIntegration(parsed, true);
+          const previous = credentials;
+          const updated =
+            parsed.credential !== undefined
+              ? { ...credentials, [parsed.retailerId]: parsed.credential }
+              : credentials;
+          if (parsed.credential !== undefined) await vault.save(updated);
+          try {
+            const next = await engine.configureIntegration(parsed);
+            credentials = updated;
+            return next;
+          } catch (error) {
+            if (parsed.credential !== undefined) await vault.save(previous);
+            throw error;
+          }
+        });
       });
       engine.on("snapshot", (snapshot) => {
         if (window && !window.isDestroyed())

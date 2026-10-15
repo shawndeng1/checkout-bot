@@ -1,9 +1,21 @@
+import {
+  observationSchema,
+  orderStatusSchema,
+  type InventoryObservation,
+  type OrderStatus,
+} from "../../retailer-sdk/src/index";
+import type {
+  InventoryRecord,
+  InventoryNotice,
+  CheckoutAttempt,
+  Reconciliation,
+} from "../../shared-types/src/index";
 import type { CartResult, CheckoutResult } from "../../retailer-sdk/src/index";
 import { migrations } from "./migrations";
 import { DatabaseSync, backup, type SQLInputValue } from "node:sqlite";
 import { mkdirSync, existsSync, chmodSync, renameSync, rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import {
   groupSchema,
   taskSchema,
@@ -54,12 +66,17 @@ export class Store {
         throw new Error("Database was created by a newer application version");
       if (options.readOnly && version < migrations.at(-1)!.version)
         throw new Error("Database requires migration before read-only access");
-      if (!options.readOnly && version === 1 && !existsSync(path + ".v1.bak")) {
-        const pending = path + `.v1.bak.${randomUUID()}.tmp`;
+      if (
+        !options.readOnly &&
+        version > 0 &&
+        version < migrations.at(-1)!.version &&
+        !existsSync(path + `.v${version}.bak`)
+      ) {
+        const pending = path + `.v${version}.bak.${randomUUID()}.tmp`;
         try {
           await backup(store.db, pending);
           chmodSync(pending, 0o600);
-          renameSync(pending, path + ".v1.bak");
+          renameSync(pending, path + `.v${version}.bak`);
         } finally {
           if (existsSync(pending)) rmSync(pending);
         }
@@ -167,10 +184,22 @@ export class Store {
     return {
       revision: this.revision(),
       retailers: [],
+      inventory: this.rows("inventory_events", "ORDER BY rowid DESC LIMIT 500"),
+      latestInventory: this.rows("latest_inventory"),
+      notices: this.rows("notices", "ORDER BY rowid DESC LIMIT 100"),
+      attempts: this.rows(
+        "checkout_attempts",
+        `WHERE id IN (SELECT id FROM checkout_attempts ORDER BY rowid DESC LIMIT 500) OR id IN (SELECT json_extract(data,'$.runId') FROM tasks WHERE json_extract(data,'$.state')='UNKNOWN_OUTCOME') ORDER BY rowid DESC`,
+      ),
+      reconciliations: this.rows(
+        "reconciliations",
+        "ORDER BY rowid DESC LIMIT 500",
+      ),
       groups: this.rows("groups"),
       tasks: this.rows<Task>("tasks").map((task) => ({
         ...task,
         variantId: task.variantId ?? null,
+        workflow: task.workflow ?? "MONITOR_AND_CHECKOUT",
       })),
       profiles: this.rows("profiles"),
       proxies: this.rows("proxies"),
@@ -191,7 +220,11 @@ export class Store {
   task(id: string): Task {
     const task = this.read<Task>("tasks", id);
     if (!task) throw new Error("Task not found");
-    return { ...task, variantId: task.variantId ?? null };
+    return {
+      ...task,
+      variantId: task.variantId ?? null,
+      workflow: task.workflow ?? "MONITOR_AND_CHECKOUT",
+    };
   }
   saveGroup(input: unknown) {
     const data = groupSchema.parse(input);
@@ -349,7 +382,12 @@ export class Store {
       );
     });
   }
-  beginCheckout(id: string, cart: CartResult) {
+  beginCheckout(
+    id: string,
+    cart: CartResult,
+    retailerId?: string,
+    configFingerprint?: string,
+  ) {
     return this.transaction(() => {
       const runId = this.task(id).runId;
       if (!runId) throw new Error("No execution ID");
@@ -360,6 +398,9 @@ export class Store {
           id: runId,
           taskId: id,
           cart,
+          retailerId,
+          configFingerprint,
+          sourceId: cart.sourceId,
           status: "pending",
           submittedAt: new Date().toISOString(),
         }),
@@ -417,7 +458,11 @@ export class Store {
     const resume: string[] = [];
     for (const task of this.snapshot().tasks)
       this.transaction(() => {
-        if (task.state === "MONITORING") {
+        if (
+          task.state === "MONITORING" ||
+          (task.state === "STOCK_DETECTED" &&
+            task.workflow !== "MONITOR_AND_CHECKOUT")
+        ) {
           this.transition(
             task.id,
             "CANCELLED",
@@ -459,7 +504,212 @@ export class Store {
           this.recoveryTag(task.id, "interrupted-operation");
         }
       });
+    for (const reconciliation of this.rows<Reconciliation>("reconciliations"))
+      if (reconciliation.status === "started")
+        this.run("UPDATE reconciliations SET data=? WHERE id=?", [
+          JSON.stringify({
+            ...reconciliation,
+            status: "interrupted",
+            message: "Status lookup interrupted; safe to check again",
+          }),
+          reconciliation.id,
+        ]);
     return resume;
+  }
+
+  retailerConfig(id: string): Record<string, unknown> {
+    return this.read<Record<string, unknown>>("retailer_configs", id) ?? {};
+  }
+  saveRetailerConfig(id: string, config: Record<string, unknown>) {
+    this.put("retailer_configs", id, config);
+  }
+  recordInventory(
+    ids: string[],
+    input: InventoryObservation,
+    changed = true,
+  ): InventoryNotice | undefined {
+    const event = observationSchema.parse(input);
+    return this.transaction(() => {
+      let notice: InventoryNotice | undefined;
+      for (const taskId of ids) {
+        const task = this.task(taskId);
+        const previous = this.read<InventoryRecord>("latest_inventory", taskId);
+        const record: InventoryRecord = {
+          id: createHash("sha256")
+            .update(JSON.stringify([taskId, event.streamId, event.eventId]))
+            .digest("hex"),
+          taskId,
+          runId: task.runId,
+          observation: event,
+          receivedAt: new Date().toISOString(),
+        };
+        this.put("latest_inventory", taskId, record);
+        if (changed)
+          this.run("INSERT OR IGNORE INTO inventory_events VALUES(?,?,?)", [
+            record.id,
+            taskId,
+            JSON.stringify(record),
+          ]);
+        if (task.workflow !== "MONITOR_AND_CHECKOUT") {
+          if (
+            event.availability === "in-stock" &&
+            task.state === "MONITORING"
+          ) {
+            this.update(taskId, "STOCK_DETECTED");
+            this.log(taskId, "Inventory available; continuous monitoring");
+          } else if (
+            event.availability !== "in-stock" &&
+            task.state === "STOCK_DETECTED"
+          ) {
+            this.update(taskId, "MONITORING");
+            this.log(taskId, "Availability changed; monitoring continues");
+          }
+        }
+        if (
+          changed &&
+          task.workflow === "MONITOR_AND_NOTIFY" &&
+          this.getSettings().inventoryNotifications &&
+          event.availability === "in-stock" &&
+          previous?.observation.availability !== "in-stock"
+        ) {
+          const key = createHash("sha256")
+            .update(
+              JSON.stringify([
+                event.retailerId,
+                event.product,
+                event.streamId,
+                event.eventId,
+              ]),
+            )
+            .digest("hex");
+          if (!this.read("notices", key)) {
+            notice = {
+              id: key,
+              taskId,
+              product: task.product,
+              variant: task.variantId,
+              retailer: event.retailerId,
+              at: new Date().toISOString(),
+              message: `${task.product}${task.variantId ? " / " + task.variantId : ""} is available`,
+            };
+            this.run("INSERT INTO notices VALUES(?,?,?)", [
+              key,
+              taskId,
+              JSON.stringify(notice),
+            ]);
+          }
+        }
+      }
+      this.run(
+        "DELETE FROM inventory_events WHERE id IN(SELECT id FROM inventory_events ORDER BY rowid DESC LIMIT -1 OFFSET 10000)",
+      );
+      this.run(
+        "DELETE FROM notices WHERE id IN(SELECT id FROM notices ORDER BY rowid DESC LIMIT -1 OFFSET 1000)",
+      );
+      return notice;
+    });
+  }
+  attempt(id: string) {
+    return this.read<CheckoutAttempt>("checkout_attempts", id);
+  }
+  beginReconciliation(taskId: string) {
+    return this.transaction(() => {
+      const task = this.task(taskId);
+      if (
+        task.state !== "UNKNOWN_OUTCOME" ||
+        !task.runId ||
+        !this.attempt(task.runId)
+      )
+        throw new Error("No unknown checkout attempt to reconcile");
+      const row: Reconciliation = {
+        id: randomUUID(),
+        taskId,
+        attemptId: task.runId,
+        at: new Date().toISOString(),
+        status: "started",
+        message: "Checking order status; no order will be submitted",
+      };
+      this.run("INSERT INTO reconciliations VALUES(?,?,?,?)", [
+        row.id,
+        taskId,
+        row.attemptId,
+        JSON.stringify(row),
+      ]);
+      return row;
+    });
+  }
+  finishReconciliation(id: string, input?: unknown, errorMessage?: string) {
+    return this.transaction(() => {
+      const lookup = this.read<Reconciliation>("reconciliations", id);
+      if (!lookup || lookup.status !== "started") return;
+      const attempt = this.attempt(lookup.attemptId);
+      const task = this.task(lookup.taskId);
+      if (!attempt) throw new Error("Attempt missing");
+      let status: Reconciliation["status"] = "error";
+      let message = errorMessage ?? "Invalid status evidence";
+      let result: OrderStatus | undefined;
+      const parsed = orderStatusSchema.safeParse(input);
+      if (parsed.success) {
+        const candidate = parsed.data;
+        const last = attempt.lastStatus;
+        if (
+          candidate.idempotencyKey !== attempt.id ||
+          !attempt.sourceId ||
+          candidate.sourceId !== attempt.sourceId
+        )
+          message = "Source or attempt mismatch; outcome remains unknown";
+        else if (
+          candidate.checkedAt < Date.now() - 30000 ||
+          candidate.checkedAt > Date.now() + 5000 ||
+          candidate.checkedAt < Date.parse(attempt.submittedAt) ||
+          candidate.checkedAt < Date.parse(lookup.at) ||
+          (last &&
+            (candidate.sequence < last.sequence ||
+              candidate.checkedAt < last.checkedAt ||
+              (candidate.sequence === last.sequence &&
+                (candidate.status !== last.status ||
+                  (candidate.status === "completed" &&
+                    last.status === "completed" &&
+                    candidate.orderId !== last.orderId)))))
+        )
+          message = "Stale status evidence ignored";
+        else {
+          result = candidate;
+          status = candidate.status;
+          message =
+            candidate.status === "completed"
+              ? `Confirmed order ${candidate.orderId}`
+              : candidate.status === "failed"
+                ? candidate.reason
+                : (candidate.reason ?? "Order status is not yet conclusive");
+        }
+      }
+      this.run("UPDATE reconciliations SET data=? WHERE id=?", [
+        JSON.stringify({ ...lookup, status, message, result }),
+        id,
+      ]);
+      if (result) {
+        this.run("UPDATE checkout_attempts SET data=? WHERE id=?", [
+          JSON.stringify({ ...attempt, lastStatus: result }),
+          attempt.id,
+        ]);
+      }
+      if (
+        task.state === "UNKNOWN_OUTCOME" &&
+        task.runId === attempt.id &&
+        result?.authoritative
+      ) {
+        if (result.status === "completed")
+          this.finishCheckout(task.id, "COMPLETED", message, {
+            orderId: result.orderId,
+            status: "completed",
+            idempotencyKey: attempt.id,
+          });
+        else if (result.status === "failed")
+          this.finishCheckout(task.id, "FAILED", message);
+      }
+      this.log(task.id, `Order status: ${message}`);
+    });
   }
   close() {
     this.db.close();

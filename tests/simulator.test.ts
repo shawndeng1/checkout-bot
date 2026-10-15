@@ -156,5 +156,5 @@ it("registers adapters with capability and rate-policy validation", () => {
       ...definition,
       capabilities: { ...simulatedCapabilities, simulated: false },
     }),
-  ).toThrow("simulated");
+  ).toThrow("inventory-only");
 });

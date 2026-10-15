@@ -6,6 +6,8 @@ test-results/
 playwright-report/
 *.sqlite-wal
 *.sqlite-shm
-*.sqlite.v1.bak
+*.sqlite.v*.bak
 *.sqlite.*.tmp
 .pnpm-store/
+
+credentials.enc.json*

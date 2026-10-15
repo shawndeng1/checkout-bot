@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   RetailerError,
+  orderStatusSchema,
   productRef,
   simulatedCapabilities,
   type RetailerAdapter,
@@ -21,6 +22,7 @@ const observation = z.object({
   availability: z.enum(["in-stock", "out-of-stock", "unknown"]),
 });
 const cart = z.object({
+  sourceId: z.string(),
   id: z.string(),
   product,
   quantity: z.number().int().positive(),
@@ -32,7 +34,7 @@ const checkout = z.object({
 });
 export class HttpSimulatorAdapter implements RetailerAdapter {
   readonly id = "simulator";
-  readonly capabilities = simulatedCapabilities;
+  readonly capabilities = { ...simulatedCapabilities, orderStatus: true };
   constructor(
     private baseUrl: string,
     private timeoutMs = 3000,
@@ -130,6 +132,13 @@ export class HttpSimulatorAdapter implements RetailerAdapter {
       signal,
       { cartId: cartResult.id, idempotencyKey },
       true,
+    );
+  }
+  lookupOrder(idempotencyKey: string, signal: AbortSignal) {
+    return this.request(
+      "/orders/status?" + new URLSearchParams({ idempotencyKey }),
+      orderStatusSchema,
+      signal,
     );
   }
   async inventory(task: Task, signal: AbortSignal) {

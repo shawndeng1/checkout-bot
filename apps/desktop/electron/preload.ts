@@ -4,6 +4,8 @@ import type {
   Snapshot,
 } from "../../../packages/shared-types/src/index";
 const api: DesktopAPI = {
+  configureIntegration: (input) =>
+    ipcRenderer.invoke("retail:configure", input),
   snapshot: () => ipcRenderer.invoke("retail:snapshot"),
   command: (command) => ipcRenderer.invoke("retail:command", command),
   subscribe: (callback) => {

@@ -17,6 +17,9 @@ const controlSchema = z
     retryAfterMs: z.number().int().min(0).max(60000).optional(),
     checkoutFailure: z.boolean().optional(),
     dropCheckoutResponse: z.boolean().optional(),
+    completionDelayMs: z.number().int().min(0).max(60000).optional(),
+    invalidStatus: z.boolean().optional(),
+    statusAgeMs: z.number().int().min(0).max(120000).optional(),
   })
   .strict();
 async function body(request: IncomingMessage) {
@@ -33,6 +36,7 @@ async function body(request: IncomingMessage) {
 export async function startSimulator(port = 0) {
   const token = randomUUID();
   const streamId = randomUUID();
+  const completions = new Set<ReturnType<typeof setTimeout>>();
   const products = [
     {
       id: "SKU-42",
@@ -44,7 +48,16 @@ export async function startSimulator(port = 0) {
     },
   ];
   const carts = new Map<string, CartResult>();
-  const orders = new Map<string, { cartId: string; result: CheckoutResult }>();
+  const orders = new Map<
+    string,
+    {
+      cartId: string;
+      result?: CheckoutResult;
+      status: "completed" | "failed" | "pending";
+      dueAt?: number;
+      sequence: number;
+    }
+  >();
   const controls = {
     latencyMs: 0,
     failNext: 0,
@@ -52,12 +65,16 @@ export async function startSimulator(port = 0) {
     retryAfterMs: 100,
     checkoutFailure: false,
     dropCheckoutResponse: false,
+    completionDelayMs: 0,
+    invalidStatus: false,
+    statusAgeMs: 0,
   };
   const metrics = {
     inventoryRequests: 0,
     cartRequests: 0,
     checkoutRequests: 0,
     ordersCreated: 0,
+    statusRequests: 0,
   };
   const server = createServer(async (request, response) => {
     const send = (
@@ -160,6 +177,55 @@ export async function startSimulator(port = 0) {
         });
         return;
       }
+      if (request.method === "GET" && url.pathname === "/orders/status") {
+        metrics.statusRequests++;
+        const key = z
+          .string()
+          .min(1)
+          .max(200)
+          .parse(url.searchParams.get("idempotencyKey"));
+        if (controls.invalidStatus) {
+          send(200, { status: "completed", orderId: 42 });
+          return;
+        }
+        const order = orders.get(key);
+        const base = {
+          idempotencyKey: key,
+          sourceId: streamId,
+          sequence: order?.sequence ?? 0,
+          checkedAt: Date.now() - controls.statusAgeMs,
+        };
+        if (!order)
+          send(200, {
+            ...base,
+            status: "unresolved",
+            authoritative: false,
+            reason:
+              "No record in this simulator instance; absence is not failure evidence",
+          });
+        else if (order.status === "completed")
+          send(200, {
+            ...base,
+            status: "completed",
+            authoritative: true,
+            orderId: order.result!.orderId,
+          });
+        else if (order.status === "failed")
+          send(200, {
+            ...base,
+            status: "failed",
+            authoritative: true,
+            reason: "Simulated checkout declined",
+          });
+        else
+          send(200, {
+            ...base,
+            status: "pending",
+            authoritative: false,
+            reason: "Simulated order is still processing",
+          });
+        return;
+      }
       if (request.method === "POST" && url.pathname === "/carts") {
         metrics.cartRequests++;
         const ref = productSchema.parse(await body(request));
@@ -174,6 +240,7 @@ export async function startSimulator(port = 0) {
           id: randomUUID(),
           product: ref,
           quantity: 1,
+          sourceId: streamId,
         };
         carts.set(cart.id, cart);
         send(201, cart);
@@ -192,6 +259,10 @@ export async function startSimulator(port = 0) {
         if (existing) {
           if (existing.cartId !== input.cartId)
             send(409, { error: "Idempotency key conflict" });
+          else if (existing.status === "failed")
+            send(402, { error: "Simulated checkout declined" });
+          else if (existing.status === "pending")
+            send(202, { status: "pending" });
           else send(200, existing.result);
           return;
         }
@@ -200,6 +271,15 @@ export async function startSimulator(port = 0) {
           return;
         }
         if (controls.checkoutFailure) {
+          orders.set(input.idempotencyKey, {
+            cartId: input.cartId,
+            status: "failed",
+            sequence: 1,
+          });
+          if (controls.dropCheckoutResponse) {
+            request.socket.destroy();
+            return;
+          }
           send(402, { error: "Simulated checkout declined" });
           return;
         }
@@ -208,13 +288,33 @@ export async function startSimulator(port = 0) {
           status: "completed",
           idempotencyKey: input.idempotencyKey,
         };
-        orders.set(input.idempotencyKey, { cartId: input.cartId, result });
+        const record: {
+          cartId: string;
+          result: CheckoutResult;
+          status: "pending" | "completed";
+          sequence: number;
+        } = {
+          cartId: input.cartId,
+          result,
+          status: controls.completionDelayMs > 0 ? "pending" : "completed",
+          sequence: 1,
+        };
+        orders.set(input.idempotencyKey, record);
         metrics.ordersCreated++;
+        if (controls.completionDelayMs > 0) {
+          const timer = setTimeout(() => {
+            record.status = "completed";
+            record.sequence++;
+            completions.delete(timer);
+          }, controls.completionDelayMs);
+          completions.add(timer);
+        }
         if (controls.dropCheckoutResponse) {
           request.socket.destroy();
           return;
         }
-        send(200, result);
+        if (controls.completionDelayMs > 0) send(202, { status: "pending" });
+        else send(200, result);
         return;
       }
       send(404, { error: "Unknown route" });
@@ -235,6 +335,7 @@ export async function startSimulator(port = 0) {
     token,
     metrics,
     async close() {
+      for (const timer of completions) clearTimeout(timer);
       server.closeAllConnections();
       await new Promise<void>((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve())),

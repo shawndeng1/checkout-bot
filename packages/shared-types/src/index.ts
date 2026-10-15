@@ -1,3 +1,9 @@
+import type {
+  InventoryObservation,
+  OrderStatus,
+  RetailerCapabilities,
+  ConfigField,
+} from "../../retailer-sdk/src/index";
 import { z } from "zod";
 export const states = [
   "CREATED",
@@ -33,6 +39,9 @@ export const taskSchema = z
     id: id.optional(),
     groupId: id,
     name,
+    workflow: z
+      .enum(["MONITOR_ONLY", "MONITOR_AND_NOTIFY", "MONITOR_AND_CHECKOUT"])
+      .default("MONITOR_AND_CHECKOUT"),
     product: name,
     variantId: z.string().trim().min(1).max(120).nullable().default(null),
     profileId: id.nullable().default(null),
@@ -100,6 +109,8 @@ export const settingsSchema = z
     concurrency: z.number().int().min(1).max(20),
     resumeMonitoring: z.boolean().default(false),
     notifications: z.boolean(),
+    inventoryNotifications: z.boolean().default(true),
+    nativeNotifications: z.boolean().default(false),
     logLevel: z.enum(["info", "debug"]),
     launchView: z.enum([
       "Dashboard",
@@ -143,7 +154,19 @@ export interface Run {
 }
 export interface Snapshot {
   revision: number;
-  retailers: { id: string; name: string }[];
+  retailers: {
+    id: string;
+    name: string;
+    capabilities: RetailerCapabilities;
+    configurationFields: ConfigField[];
+    credentialConfigured: boolean;
+    config: Record<string, unknown>;
+  }[];
+  inventory: InventoryRecord[];
+  latestInventory: InventoryRecord[];
+  notices: InventoryNotice[];
+  attempts: CheckoutAttempt[];
+  reconciliations: Reconciliation[];
   groups: Group[];
   tasks: Task[];
   profiles: Profile[];
@@ -171,14 +194,69 @@ export const commandSchema = z.discriminatedUnion("type", [
         "stop",
         "restart",
         "approve",
+        "reconcile",
       ]),
       id,
     })
     .strict(),
 ]);
-export type Command = z.infer<typeof commandSchema>;
+export type Command = z.input<typeof commandSchema>;
+export interface InventoryRecord {
+  id: string;
+  taskId: string;
+  runId: string | null;
+  observation: InventoryObservation;
+  receivedAt: string;
+}
+export interface InventoryNotice {
+  id: string;
+  taskId: string;
+  product: string;
+  variant: string | null;
+  retailer: string;
+  at: string;
+  message: string;
+}
+export interface CheckoutAttempt {
+  id: string;
+  taskId: string;
+  cart: import("../../retailer-sdk/src/index").CartResult;
+  status: string;
+  submittedAt: string;
+  retailerId?: string;
+  sourceId?: string;
+  configFingerprint?: string;
+  result?: import("../../retailer-sdk/src/index").CheckoutResult;
+  lastStatus?: OrderStatus;
+}
+export interface Reconciliation {
+  id: string;
+  taskId: string;
+  attemptId: string;
+  at: string;
+  status:
+    | "started"
+    | "completed"
+    | "failed"
+    | "pending"
+    | "unresolved"
+    | "error"
+    | "interrupted";
+  message: string;
+  result?: OrderStatus;
+}
+export const integrationInputSchema = z
+  .object({
+    retailerId: z.string().regex(/^[a-z0-9-]{1,60}$/),
+    config: z.record(z.string(), z.unknown()),
+    credential: z.string().max(4096).optional(),
+  })
+  .strict();
+export type IntegrationInput = z.infer<typeof integrationInputSchema>;
+
 export interface DesktopAPI {
   snapshot(): Promise<Snapshot>;
   command(command: Command): Promise<Snapshot>;
+  configureIntegration(input: IntegrationInput): Promise<Snapshot>;
   subscribe(callback: (snapshot: Snapshot) => void): () => void;
 }

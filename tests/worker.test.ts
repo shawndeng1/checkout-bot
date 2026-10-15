@@ -84,3 +84,67 @@ it("rejects pending RPCs when its worker exits unexpectedly", async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+it("recovers inventory watches and their persisted observations after worker termination", async () => {
+  const { vi } = await import("vitest");
+  const dir = mkdtempSync(join(tmpdir(), "orbit-watch-crash-")),
+    workerPath = join(dir, "backend.cjs"),
+    database = join(dir, "db.sqlite");
+  await build({
+    entryPoints: ["apps/desktop/electron/backend-worker.ts"],
+    outfile: workerPath,
+    bundle: true,
+    platform: "node",
+    format: "cjs",
+  });
+  let backend = new BackendClient(workerPath, database);
+  try {
+    await backend.ready;
+    let data = await backend.snapshot();
+    await backend.command({
+      type: "settings",
+      data: { ...data.settings, resumeMonitoring: true },
+    });
+    data = await backend.command({
+      type: "saveGroup",
+      data: { name: "Watch crash", retailer: "mock" },
+    });
+    data = await backend.command({
+      type: "saveTask",
+      data: {
+        name: "Continuous",
+        groupId: data.groups[0].id,
+        product: "sku",
+        workflow: "MONITOR_ONLY",
+        scenario: "available",
+        intervalMs: 100,
+        maxRetries: 1,
+      },
+    });
+    const id = data.tasks[0].id;
+    await backend.command({ type: "start", id });
+    await vi.waitFor(
+      async () =>
+        expect((await backend.snapshot()).tasks[0].state).toBe(
+          "STOCK_DETECTED",
+        ),
+      { timeout: 3000 },
+    );
+    const run = (await backend.snapshot()).tasks[0].runId;
+    await (backend as any).worker.terminate();
+    await backend.shutdown().catch(() => {});
+    backend = new BackendClient(workerPath, database);
+    await backend.ready;
+    data = await backend.snapshot();
+    expect(data.inventory.length).toBeGreaterThan(0);
+    expect(data.runs.find((row) => row.id === run)?.recovery).toBe(
+      "interrupted-monitoring",
+    );
+    expect(data.tasks[0].runId).not.toBe(run);
+    expect(data.attempts).toEqual([]);
+    await backend.command({ type: "stop", id });
+  } finally {
+    await backend.shutdown().catch(() => {});
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

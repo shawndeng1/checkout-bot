@@ -24,4 +24,16 @@ export const migrations = [
     INSERT INTO metadata VALUES('revision',0);
   `,
   },
+  {
+    version: 3,
+    sql: `
+ CREATE TABLE inventory_events(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,data TEXT NOT NULL);
+ CREATE INDEX inventory_task ON inventory_events(task_id);
+ CREATE TABLE latest_inventory(id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,data TEXT NOT NULL);
+ CREATE TABLE notices(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,data TEXT NOT NULL);
+ CREATE TABLE reconciliations(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,attempt_id TEXT NOT NULL REFERENCES checkout_attempts(id) ON DELETE CASCADE,data TEXT NOT NULL);
+ CREATE INDEX reconciliations_attempt ON reconciliations(attempt_id);
+ CREATE TABLE retailer_configs(id TEXT PRIMARY KEY,data TEXT NOT NULL);
+ `,
+  },
 ];

@@ -27,7 +27,10 @@ test("desktop CRUD, live events, stop, logs and restart persistence", async () =
         node: typeof (window as any).require,
         api: Object.keys(window.retail),
       })),
-    ).toEqual({ node: "undefined", api: ["snapshot", "command", "subscribe"] });
+    ).toEqual({
+      node: "undefined",
+      api: ["configureIntegration", "snapshot", "command", "subscribe"],
+    });
     await page
       .getByRole("button", { name: "Tasks", exact: false })
       .first()

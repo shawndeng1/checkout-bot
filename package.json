@@ -14,7 +14,8 @@
     "format": "prettier --write apps packages scripts tests docs *.md *.ts *.json *.yaml",
     "format:check": "prettier --check apps packages scripts tests docs *.md *.ts *.json *.yaml",
     "simulator": "node scripts/simulator.mjs",
-    "benchmark": "node scripts/benchmark.mjs"
+    "benchmark": "node scripts/benchmark.mjs",
+    "fixture:shopify": "node scripts/shopify-fixture.mjs"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",

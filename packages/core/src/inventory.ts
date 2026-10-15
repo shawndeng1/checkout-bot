@@ -3,6 +3,7 @@ import {
   RetailerError,
   type InventoryObservation,
   type RetailerAdapter,
+  observationSchema,
 } from "../../retailer-sdk/src/index";
 import type { Task } from "../../shared-types/src/index";
 import { RequestScheduler } from "./scheduler";
@@ -13,6 +14,19 @@ export class ObservationTracker {
   private stream = "";
   private retired = new Set<string>();
   private ids = new Set<string>();
+  private availability?: string;
+  heartbeat(event: InventoryObservation) {
+    if (
+      event.streamId === this.stream &&
+      event.sequence === this.lastSequence &&
+      event.observedAt >= this.lastAt &&
+      event.availability === this.availability
+    ) {
+      this.lastAt = event.observedAt;
+      return true;
+    }
+    return false;
+  }
   accept(event: InventoryObservation) {
     if (
       event.observedAt < this.lastAt ||
@@ -27,6 +41,7 @@ export class ObservationTracker {
       this.stream = event.streamId;
       this.lastSequence = -1;
     }
+    this.availability = event.availability;
     this.lastAt = event.observedAt;
     this.lastSequence = event.sequence;
     this.ids.add(`${event.streamId}:${event.eventId}`);
@@ -37,6 +52,7 @@ export class ObservationTracker {
   }
 }
 interface Subscriber {
+  continuous: boolean;
   id: string;
   resolve(value: InventoryObservation): void;
   reject(error: unknown): void;
@@ -50,6 +66,7 @@ interface Subscription {
   controller: AbortController;
   subscribers: Map<string, Subscriber>;
   tracker: ObservationTracker;
+  lastEvent?: InventoryObservation;
 }
 export class SharedInventory {
   private subscriptions = new Map<string, Subscription>();
@@ -63,6 +80,11 @@ export class SharedInventory {
     private log: (ids: string[], message: string) => void,
     private backoffMs = 300,
     private outOfStock: (ids: string[]) => void = () => {},
+    private observed: (
+      ids: string[],
+      event: InventoryObservation,
+      changed: boolean,
+    ) => void = () => {},
   ) {}
   get size() {
     return this.subscriptions.size;
@@ -86,10 +108,14 @@ export class SharedInventory {
       adapter.capabilities.sharedInventory ? null : task.id,
     ]);
   }
+  watch(task: Task, adapter: RetailerAdapter, signal: AbortSignal) {
+    return this.wait(task, adapter, signal, true);
+  }
   wait(
     task: Task,
     adapter: RetailerAdapter,
     signal: AbortSignal,
+    continuous = false,
   ): Promise<InventoryObservation> {
     if (signal.aborted) return Promise.reject(new Error("Cancelled"));
     const key = this.key(task, adapter);
@@ -115,6 +141,7 @@ export class SharedInventory {
     return new Promise((resolve, reject) => {
       const subscriber: Subscriber = {
         id: task.id,
+        continuous,
         resolve,
         reject,
         signal,
@@ -125,6 +152,17 @@ export class SharedInventory {
       };
       subscription.subscribers.set(task.id, subscriber);
       signal.addEventListener("abort", subscriber.abort, { once: true });
+      const cached = subscription.lastEvent;
+      if (
+        cached &&
+        (cached.expiresAt ?? cached.observedAt + 30000) > Date.now()
+      ) {
+        this.observed([task.id], cached, true);
+        if (!continuous && cached.availability === "in-stock") {
+          this.remove(subscription, subscriber);
+          resolve(cached);
+        }
+      }
     });
   }
   private remove(entry: Subscription, subscriber: Subscriber) {
@@ -142,16 +180,24 @@ export class SharedInventory {
     try {
       while (!signal.aborted) {
         try {
-          const event = await this.scheduler.execute(
+          const input = await this.scheduler.execute(
             entry.adapter.id,
             entry.task.id,
             signal,
             () => {
               this.polls++;
-              return entry.adapter.observe(entry.task, signal);
+              return entry.adapter.observe!(entry.task, signal);
             },
           );
           attempts = 0;
+          const event = observationSchema.parse(input);
+          if (
+            (event.expiresAt ?? event.observedAt + 30000) <= Date.now() ||
+            event.observedAt > Date.now() + 5000
+          ) {
+            await delay(entry.task.intervalMs, signal);
+            continue;
+          }
           if (
             event.retailerId !== entry.adapter.id ||
             event.product.productId !== entry.task.product ||
@@ -163,14 +209,19 @@ export class SharedInventory {
               false,
             );
           if (entry.tracker.accept(event)) {
+            entry.lastEvent = event;
+            this.observed([...entry.subscribers.keys()], event, true);
             if (event.availability === "in-stock") {
-              for (const subscriber of [...entry.subscribers.values()]) {
-                this.remove(entry, subscriber);
-                subscriber.resolve(event);
-              }
-              return;
-            }
-            this.outOfStock([...entry.subscribers.keys()]);
+              for (const subscriber of [...entry.subscribers.values()])
+                if (!subscriber.continuous) {
+                  this.remove(entry, subscriber);
+                  subscriber.resolve(event);
+                }
+              if (!entry.subscribers.size) return;
+            } else this.outOfStock([...entry.subscribers.keys()]);
+          } else if (entry.tracker.heartbeat(event)) {
+            entry.lastEvent = event;
+            this.observed([...entry.subscribers.keys()], event, false);
           }
           await delay(entry.task.intervalMs, signal);
         } catch (error) {

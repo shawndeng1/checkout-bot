@@ -1,3 +1,6 @@
+import { z } from "zod";
+export * from "./contracts";
+import type { OrderStatus, ProductDetails, ConfigField } from "./contracts";
 import type { Task } from "../../shared-types/src/index";
 export interface ProductRef {
   productId: string;
@@ -12,8 +15,10 @@ export interface InventoryObservation {
   observedAt: number;
   availability: "in-stock" | "out-of-stock" | "unknown";
   quantity?: number;
+  expiresAt?: number;
 }
 export interface CartResult {
+  sourceId?: string;
   id: string;
   product: ProductRef;
   quantity: number;
@@ -29,6 +34,9 @@ export interface AuthenticationRequirement {
   scopes: string[];
 }
 export interface RetailerCapabilities {
+  productLookup?: boolean;
+  variants?: boolean;
+  orderStatus?: boolean;
   inventory: boolean;
   cart: boolean;
   checkout: boolean;
@@ -82,6 +90,9 @@ export const simulatedCapabilities: RetailerCapabilities = {
   checkout: true,
   simulated: true,
   sharedInventory: true,
+  productLookup: false,
+  variants: true,
+  orderStatus: false,
   authentication: [{ kind: "none", scopes: [] }],
 };
 export function productRef(task: Task): ProductRef {
@@ -95,14 +106,22 @@ export interface RetailerAdapter {
   readonly capabilities: RetailerCapabilities;
   /** Extra compatibility scope (account/region/scenario). Product and configuration are keyed by the engine. */
   inventoryScope(task: Task): string;
-  observe(task: Task, signal: AbortSignal): Promise<InventoryObservation>;
-  createCart(task: Task, signal: AbortSignal): Promise<CartResult>;
-  submitCheckout(
+  observe?(task: Task, signal: AbortSignal): Promise<InventoryObservation>;
+  createCart?(task: Task, signal: AbortSignal): Promise<CartResult>;
+  submitCheckout?(
     task: Task,
     cart: CartResult,
     idempotencyKey: string,
     signal: AbortSignal,
   ): Promise<CheckoutResult>;
+  lookupProduct?(
+    identifier: string,
+    signal: AbortSignal,
+  ): Promise<ProductDetails>;
+  lookupOrder?(
+    idempotencyKey: string,
+    signal: AbortSignal,
+  ): Promise<OrderStatus>;
   /** Compatibility facade for milestone-one consumers. */
   inventory?(task: Task, signal: AbortSignal): Promise<boolean>;
   cart?(task: Task, signal: AbortSignal): Promise<string>;
@@ -113,7 +132,9 @@ export interface RetailerDefinition {
   name: string;
   capabilities: RetailerCapabilities;
   rateLimit: RateLimitPolicy;
-  create(): RetailerAdapter;
+  configurationSchema?: z.ZodType<Record<string, unknown>>;
+  configurationFields?: ConfigField[];
+  create(config: Record<string, unknown>, credential?: string): RetailerAdapter;
 }
 export class AdapterRegistry {
   private definitions = new Map<string, RetailerDefinition>();
@@ -123,8 +144,40 @@ export class AdapterRegistry {
       this.definitions.has(definition.id)
     )
       throw new Error("Invalid or duplicate retailer registration");
-    if (!definition.capabilities.simulated)
-      throw new Error("Only simulated adapters are enabled");
+    z.object({
+      inventory: z.boolean(),
+      cart: z.boolean(),
+      checkout: z.boolean(),
+      simulated: z.boolean(),
+      sharedInventory: z.boolean(),
+      productLookup: z.boolean().optional(),
+      variants: z.boolean().optional(),
+      orderStatus: z.boolean().optional(),
+      authentication: z.array(
+        z
+          .object({
+            kind: z.enum(["none", "session", "oauth"]),
+            scopes: z.array(z.string()),
+          })
+          .strict(),
+      ),
+    })
+      .strict()
+      .parse(definition.capabilities);
+    if (
+      !definition.capabilities.simulated &&
+      (definition.capabilities.cart ||
+        definition.capabilities.checkout ||
+        definition.capabilities.orderStatus)
+    )
+      throw new Error("Real adapters must be inventory-only");
+    if (
+      !["inventory", "cart", "checkout", "productLookup", "orderStatus"].some(
+        (key) =>
+          definition.capabilities[key as keyof RetailerCapabilities] === true,
+      )
+    )
+      throw new Error("At least one retailer capability is required");
     if (
       !Number.isInteger(definition.rateLimit.maxConcurrentRequests) ||
       definition.rateLimit.maxConcurrentRequests < 1 ||
@@ -143,19 +196,45 @@ export class AdapterRegistry {
     if (!definition) throw new Error(`Retailer is not registered: ${id}`);
     return definition;
   }
-  create(id: string) {
-    const adapter = this.get(id).create();
-    if (adapter.id !== id || !adapter.capabilities.simulated)
+  create(
+    id: string,
+    config: Record<string, unknown> = {},
+    credential?: string,
+  ) {
+    const definition = this.get(id);
+    const validated = this.validateConfig(id, config);
+    const adapter = definition.create(validated, credential);
+    if (
+      adapter.id !== id ||
+      JSON.stringify(adapter.capabilities) !==
+        JSON.stringify(definition.capabilities) ||
+      (adapter.capabilities.inventory &&
+        typeof adapter.observe !== "function") ||
+      typeof adapter.inventoryScope !== "function" ||
+      (adapter.capabilities.cart && typeof adapter.createCart !== "function") ||
+      (adapter.capabilities.checkout &&
+        typeof adapter.submitCheckout !== "function") ||
+      (adapter.capabilities.orderStatus &&
+        typeof adapter.lookupOrder !== "function") ||
+      (adapter.capabilities.productLookup &&
+        typeof adapter.lookupProduct !== "function")
+    )
       throw new Error("Invalid adapter factory");
     return adapter;
   }
+  validateConfig(id: string, config: Record<string, unknown>) {
+    return (this.get(id).configurationSchema ?? z.object({}).strict()).parse(
+      config,
+    );
+  }
   list() {
     return [...this.definitions.values()].map(
-      ({ id, name, capabilities, rateLimit }) => ({
+      ({ id, name, capabilities, rateLimit, configurationFields }) => ({
         id,
         name,
         capabilities,
         rateLimit,
+        configurationFields: configurationFields ?? [],
       }),
     );
   }

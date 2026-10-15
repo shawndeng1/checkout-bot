@@ -115,10 +115,19 @@ it("opens an actual SQL.js v1 file without converting or losing user data", asyn
     const store = await Store.open(path);
     const migrated = store.snapshot();
     expect(migrated.groups[0].name).toBe("Preserved");
-    expect(migrated.tasks[0]).toEqual({ ...task, variantId: null });
+    expect(migrated.tasks[0]).toEqual({
+      ...task,
+      variantId: null,
+      workflow: "MONITOR_AND_CHECKOUT",
+    });
     expect(migrated.profiles).toEqual([profile]);
     expect(migrated.proxies).toEqual([proxy]);
-    expect(migrated.settings).toEqual({ ...settings, resumeMonitoring: false });
+    expect(migrated.settings).toEqual({
+      ...settings,
+      resumeMonitoring: false,
+      inventoryNotifications: true,
+      nativeNotifications: false,
+    });
     expect(migrated.logs[0].message).toBe("Legacy event");
     expect(migrated.runs[0].outcome).toBe("COMPLETED");
     const backup = new DatabaseSync(path + ".v1.bak", { readOnly: true });
@@ -228,6 +237,99 @@ it("rejects a future schema and rolls back a failed migration without dropping l
     check.exec("UPDATE migrations SET version=99");
     check.close();
     await expect(Store.open(path)).rejects.toThrow("newer application");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it("backs up schema v2 and preserves approval, attempt, revision and legacy task records when adding v3 tables", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "orbit-v2-"));
+  const path = join(dir, "db.sqlite");
+  try {
+    const old = new DatabaseSync(path);
+    old.exec(
+      "PRAGMA foreign_keys=ON; CREATE TABLE migrations(version INTEGER PRIMARY KEY)",
+    );
+    for (const migration of migrations.slice(0, 2)) {
+      old.exec(migration.sql);
+      old.prepare("INSERT INTO migrations VALUES(?)").run(migration.version);
+    }
+    const group = { id: "group", name: "Preserved", retailer: "simulator" },
+      task = {
+        id: "task",
+        groupId: "group",
+        name: "Old",
+        product: "SKU-42",
+        scenario: "available",
+        intervalMs: 100,
+        maxRetries: 2,
+        profileId: null,
+        proxyId: null,
+        variantId: "blue",
+        state: "UNKNOWN_OUTCOME",
+        runId: "run",
+        updatedAt: new Date().toISOString(),
+      };
+    const cart = {
+      id: "cart",
+      product: { productId: "SKU-42", variantId: "blue" },
+      quantity: 1,
+    };
+    const attempt = {
+      id: "run",
+      taskId: "task",
+      cart,
+      status: "unknown",
+      submittedAt: new Date().toISOString(),
+    };
+    old
+      .prepare("INSERT INTO groups VALUES(?,?)")
+      .run(group.id, JSON.stringify(group));
+    old
+      .prepare("INSERT INTO tasks VALUES(?,?,?)")
+      .run(task.id, task.groupId, JSON.stringify(task));
+    old.prepare("INSERT INTO runs VALUES(?,?,?)").run(
+      "run",
+      "task",
+      JSON.stringify({
+        id: "run",
+        taskId: "task",
+        outcome: "UNKNOWN_OUTCOME",
+        startedAt: new Date().toISOString(),
+        endedAt: null,
+      }),
+    );
+    old
+      .prepare("INSERT INTO checkout_attempts VALUES(?,?,?)")
+      .run("run", "task", JSON.stringify(attempt));
+    old.prepare("UPDATE metadata SET value=91 WHERE key='revision'").run();
+    old.close();
+    let store = await Store.open(path);
+    expect(store.task("task").workflow).toBe("MONITOR_AND_CHECKOUT");
+    expect(store.attempt("run")).toEqual(attempt);
+    expect(store.snapshot().revision).toBe(91);
+    expect(store.snapshot().inventory).toEqual([]);
+    expect(store.snapshot().reconciliations).toEqual([]);
+    store.recover();
+    expect(store.task("task").state).toBe("UNKNOWN_OUTCOME");
+    store.saveRetailerConfig("shopify", {
+      mode: "fixture",
+      endpoint: "http://127.0.0.1:4319",
+    });
+    store.close();
+    const backup = new DatabaseSync(path + ".v2.bak", { readOnly: true });
+    expect(
+      backup.prepare("SELECT MAX(version) AS version FROM migrations").get()
+        ?.version,
+    ).toBe(2);
+    expect(
+      backup.prepare("SELECT data FROM checkout_attempts").get()?.data,
+    ).toBe(JSON.stringify(attempt));
+    backup.close();
+    store = await Store.open(path);
+    expect(store.retailerConfig("shopify").mode).toBe("fixture");
+    expect(store.attempt("run")).toEqual(attempt);
+    store.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

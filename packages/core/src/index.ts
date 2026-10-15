@@ -18,14 +18,14 @@ import { SharedInventory } from "./inventory";
 export const transitions: Record<TaskState, readonly TaskState[]> = {
   CREATED: ["MONITORING", "CANCELLED"],
   MONITORING: ["STOCK_DETECTED", "FAILED", "CANCELLED"],
-  STOCK_DETECTED: ["CARTING", "FAILED", "CANCELLED"],
+  STOCK_DETECTED: ["MONITORING", "CARTING", "FAILED", "CANCELLED"],
   CARTING: ["AWAITING_APPROVAL", "FAILED", "CANCELLED"],
   AWAITING_APPROVAL: ["CHECKING_OUT", "FAILED", "CANCELLED"],
   CHECKING_OUT: ["COMPLETED", "FAILED", "UNKNOWN_OUTCOME"],
   COMPLETED: ["MONITORING"],
   FAILED: ["MONITORING"],
   CANCELLED: ["MONITORING"],
-  UNKNOWN_OUTCOME: [],
+  UNKNOWN_OUTCOME: ["COMPLETED", "FAILED"],
 };
 export function validateTransition(from: TaskState, to: TaskState) {
   if (!transitions[from].includes(to))
@@ -43,6 +43,10 @@ interface Active {
 export class Engine extends EventEmitter {
   private active = new Map<string, Active>();
   private shuttingDown = false;
+  private reconciling = new Map<
+    string,
+    { controller: AbortController; promise: Promise<void> }
+  >();
   private eventTimer?: ReturnType<typeof setTimeout>;
   readonly scheduler: RequestScheduler;
   readonly inventory: SharedInventory;
@@ -50,6 +54,7 @@ export class Engine extends EventEmitter {
     readonly store: Store,
     readonly registry: AdapterRegistry,
     private backoffMs = 300,
+    private credentials: Record<string, string> = {},
   ) {
     super();
     this.scheduler = new RequestScheduler(
@@ -71,6 +76,12 @@ export class Engine extends EventEmitter {
           this.publish();
         }
       },
+      (ids, event, changed) => {
+        const notice = store.recordInventory(ids, event, changed);
+        if (notice && store.getSettings().nativeNotifications)
+          this.emit("native-notification", notice);
+        this.publish();
+      },
     );
     const resume = store.recover();
     for (const task of store.snapshot().tasks)
@@ -84,9 +95,16 @@ export class Engine extends EventEmitter {
           );
       }
     for (const id of resume) {
-      if (registry.has(store.group(store.task(id).groupId).retailer))
-        this.start(id);
-      else
+      if (registry.has(store.group(store.task(id).groupId).retailer)) {
+        try {
+          this.start(id);
+        } catch {
+          store.log(
+            id,
+            "Monitoring recovery paused; verify adapter configuration and secure credentials",
+          );
+        }
+      } else
         store.log(
           id,
           "Monitoring recovery paused; retailer adapter unavailable",
@@ -97,7 +115,11 @@ export class Engine extends EventEmitter {
   snapshot() {
     return {
       ...this.store.snapshot(),
-      retailers: this.registry.list(),
+      retailers: this.registry.list().map((retailer) => ({
+        ...retailer,
+        config: this.store.retailerConfig(retailer.id),
+        credentialConfigured: !!this.credentials[retailer.id],
+      })),
       queued: this.scheduler.queued,
     };
   }
@@ -115,7 +137,11 @@ export class Engine extends EventEmitter {
     this.publish();
   }
   isBusy(id: string) {
-    return this.active.has(id) || this.store.approval(id) !== undefined;
+    return (
+      this.active.has(id) ||
+      this.reconciling.has(id) ||
+      this.store.approval(id) !== undefined
+    );
   }
   diagnostics() {
     return {
@@ -140,15 +166,22 @@ export class Engine extends EventEmitter {
     if (this.active.size >= 1000)
       throw new Error("Task execution limit reached");
     const task = this.store.task(id);
+    const retailer = this.store.group(task.groupId).retailer;
     const adapter = this.registry.create(
-      this.store.group(task.groupId).retailer,
+      retailer,
+      this.store.retailerConfig(retailer),
+      this.credentials[retailer],
     );
     if (
       !adapter.capabilities.inventory ||
-      !adapter.capabilities.cart ||
-      !adapter.capabilities.checkout
+      (task.workflow === "MONITOR_AND_CHECKOUT" &&
+        (!adapter.capabilities.simulated ||
+          !adapter.capabilities.cart ||
+          !adapter.capabilities.checkout))
     )
-      throw new Error("Adapter does not support this task workflow");
+      throw new Error(
+        "Adapter does not support this task workflow; real adapters are inventory-only",
+      );
     const context: Active = {
       id,
       adapter,
@@ -230,12 +263,16 @@ export class Engine extends EventEmitter {
         this.store.begin(id);
         this.publish();
         const task = this.store.task(id);
+        if (task.workflow !== "MONITOR_AND_CHECKOUT") {
+          await this.inventory.watch(task, adapter, signal);
+          return;
+        }
         await this.inventory.wait(task, adapter, signal);
         if (signal.aborted) throw new Error("Cancelled");
         this.move(id, "STOCK_DETECTED", "Inventory available");
         this.move(id, "CARTING", "Creating simulated cart");
         cart = await this.retry(task, adapter, signal, () =>
-          adapter.createCart(task, signal),
+          adapter.createCart!(task, signal),
         );
         if (signal.aborted) throw new Error("Cancelled");
         validateTransition(this.store.task(id).state, "AWAITING_APPROVAL");
@@ -252,10 +289,15 @@ export class Engine extends EventEmitter {
           throw new RetailerError("Simulated cart expired", "DECLINED", false);
         validateTransition(this.store.task(id).state, "CHECKING_OUT");
         // Durable intent/idempotency key is committed before any submission can happen.
-        const key = this.store.beginCheckout(id, checkoutCart);
+        const key = this.store.beginCheckout(
+          id,
+          checkoutCart,
+          adapter.id,
+          adapter.inventoryScope(task),
+        );
         context.checkoutStarted = true;
         this.publish();
-        const result = await adapter.submitCheckout(
+        const result = await adapter.submitCheckout!(
           task,
           checkoutCart,
           key,
@@ -284,7 +326,9 @@ export class Engine extends EventEmitter {
         this.shuttingDown &&
         !context.checkoutStarted &&
         (task.state === "AWAITING_APPROVAL" ||
-          (task.state === "MONITORING" &&
+          ((task.state === "MONITORING" ||
+            (task.state === "STOCK_DETECTED" &&
+              task.workflow !== "MONITOR_AND_CHECKOUT")) &&
             this.store.getSettings().resumeMonitoring))
       ) {
         this.store.log(
@@ -321,6 +365,12 @@ export class Engine extends EventEmitter {
   }
   async stop(id: string) {
     this.store.task(id);
+    const lookup = this.reconciling.get(id);
+    if (lookup) {
+      lookup.controller.abort();
+      await lookup.promise;
+      return;
+    }
     const context = this.active.get(id);
     if (context) {
       context.controller.abort();
@@ -343,6 +393,94 @@ export class Engine extends EventEmitter {
     context.approved = true;
     context.approve();
     this.publish();
+  }
+  async configureIntegration(
+    retailerId: string,
+    config: Record<string, unknown>,
+    credential?: string,
+    validateOnly = false,
+  ) {
+    if (
+      this.store
+        .snapshot()
+        .tasks.some(
+          (task) =>
+            this.store.group(task.groupId).retailer === retailerId &&
+            this.isBusy(task.id),
+        )
+    )
+      throw new Error("Stop retailer tasks before changing configuration");
+    const validated = this.registry.validateConfig(retailerId, config);
+    this.registry.create(
+      retailerId,
+      validated,
+      credential ?? this.credentials[retailerId],
+    );
+    if (validateOnly) return this.snapshot();
+    this.store.saveRetailerConfig(retailerId, validated);
+    if (credential !== undefined) this.credentials[retailerId] = credential;
+    this.publish();
+    return this.snapshot();
+  }
+  reconcile(id: string): Promise<void> {
+    if (this.shuttingDown) throw new Error("Engine is shutting down");
+    const pending = this.reconciling.get(id);
+    if (pending) return pending.promise;
+    const task = this.store.task(id);
+    const attempt = task.runId ? this.store.attempt(task.runId) : undefined;
+    if (task.state !== "UNKNOWN_OUTCOME") {
+      if (attempt?.lastStatus?.authoritative) return Promise.resolve();
+      throw new Error("Task has no unknown checkout outcome");
+    }
+    if (!attempt) throw new Error("Checkout attempt unavailable");
+    const row = this.store.beginReconciliation(id);
+    const controller = new AbortController();
+    const context = { controller, promise: Promise.resolve() };
+    this.reconciling.set(id, context);
+    context.promise = (async () => {
+      try {
+        const retailer =
+          attempt.retailerId ?? this.store.group(task.groupId).retailer;
+        const adapter = this.registry.create(
+          retailer,
+          this.store.retailerConfig(retailer),
+          this.credentials[retailer],
+        );
+        if (
+          !adapter.capabilities.simulated ||
+          !adapter.capabilities.orderStatus ||
+          !adapter.lookupOrder
+        )
+          throw new Error("Order status adapter unavailable");
+        if (attempt.configFingerprint !== adapter.inventoryScope(task))
+          throw new Error(
+            "Retailer configuration changed; source cannot be verified",
+          );
+        const result = await this.scheduler.execute(
+          retailer,
+          id,
+          controller.signal,
+          () => adapter.lookupOrder!(attempt.id, controller.signal),
+        );
+        if (controller.signal.aborted) throw new Error("Cancelled");
+        this.store.finishReconciliation(row.id, result);
+      } catch (error) {
+        this.store.finishReconciliation(
+          row.id,
+          undefined,
+          controller.signal.aborted
+            ? "Status lookup cancelled; outcome remains unknown"
+            : error instanceof Error
+              ? error.message
+              : "Status lookup failed",
+        );
+      }
+    })().finally(() => {
+      this.reconciling.delete(id);
+      this.publish();
+    });
+    this.publish();
+    return context.promise;
   }
   async command(input: Command) {
     const cmd = commandSchema.parse(input);
@@ -370,7 +508,16 @@ export class Engine extends EventEmitter {
       case "saveTask":
         if (cmd.data.id && this.isBusy(cmd.data.id))
           throw new Error("Stop the task before editing");
-        this.registry.get(this.store.group(cmd.data.groupId).retailer);
+        const definition = this.registry.get(
+          this.store.group(cmd.data.groupId).retailer,
+        );
+        if (
+          cmd.data.workflow === "MONITOR_AND_CHECKOUT" &&
+          (!definition.capabilities.simulated ||
+            !definition.capabilities.cart ||
+            !definition.capabilities.checkout)
+        )
+          throw new Error("This retailer supports inventory workflows only");
         this.store.saveTask(cmd.data);
         break;
       case "settings":
@@ -386,6 +533,9 @@ export class Engine extends EventEmitter {
       case "restart":
         await this.stop(cmd.id);
         this.start(cmd.id);
+        break;
+      case "reconcile":
+        await this.reconcile(cmd.id);
         break;
       case "approve":
         this.approve(cmd.id);
@@ -423,6 +573,9 @@ export class Engine extends EventEmitter {
   }
   async shutdown() {
     this.shuttingDown = true;
+    const lookups = [...this.reconciling.values()];
+    lookups.forEach((item) => item.controller.abort());
+    await Promise.all(lookups.map((item) => item.promise));
     const active = [...this.active.values()];
     active.forEach((context) => context.controller.abort());
     await Promise.all(active.map((context) => context.promise));
