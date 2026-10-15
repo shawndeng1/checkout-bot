@@ -1,22 +1,46 @@
-# Database
+# SQLite schema and migration strategy
 
-Migration definitions live in `packages/database/src/migrations.ts`. Each unapplied migration runs in a transaction and records its version. A database with a newer schema version is rejected rather than downgraded.
+Orbit continues to use the existing `retail.sqlite` file in Electron user data (or `RETAIL_DATA_DIR`). Milestone 2 opens it directly with native SQLite in the backend worker. SQL.js files are ordinary SQLite files: no export/import conversion or record rewrite is required.
 
-| Table      | Columns                                     | Purpose                                                        |
-| ---------- | ------------------------------------------- | -------------------------------------------------------------- |
-| migrations | version (PK)                                | Applied migration versions                                     |
-| groups     | id (PK), data (JSON text)                   | Name and mock retailer identifier                              |
-| tasks      | id (PK), group_id (FK), data (JSON text)    | Configuration, current state, execution ID, update timestamp   |
-| profiles   | id (PK), data (JSON text)                   | Named group, contact/shipping fields, mock payment placeholder |
-| proxies    | id (PK), data (JSON text)                   | Named group, HTTP/SOCKS5 protocol, host, port                  |
-| runs       | id (PK), task_id (FK), data (JSON text)     | Start/end timestamps and terminal outcome                      |
-| logs       | id (PK), task_id (FK), at, data (JSON text) | Execution ID, state, level, timestamp and message              |
-| settings   | id (PK), data (JSON text)                   | Singleton `app`: concurrency, notices, log level, startup view |
+## Migration safety
 
-Indexes: `tasks_group(group_id)`, `logs_task_time(task_id, at)`, `runs_task(task_id)`. Deleting groups cascades to tasks, runs, and logs. Deleting tasks cascades to history. Assigned profiles/proxies cannot be deleted until tasks unassign them. Profile/proxy group names are embedded organizational labels in this milestone, rather than separate group entities.
+1. Acquire the application Store owner; open one native connection with foreign keys.
+2. Enable WAL and FULL synchronous commits, and set a bounded busy timeout (1 second by default).
+3. Reject schema versions newer than the application supports. Read-only opens require an already migrated schema.
+4. Before migrating v1, use SQLite's online backup API to write a temporary backup, then atomically rename it to `retail.sqlite.v1.bak`. The backup includes committed WAL contents and is not overwritten on subsequent starts.
+5. Apply each unapplied migration transactionally and record its version. A migration failure rolls back schema changes and leaves user records intact. Failed Store opens close the connection and release ownership.
 
-UUIDs identify entities. Timestamps use ISO UTC strings and render in local time. Strict Zod schemas validate incoming configurations, including placeholder-token prefixes. Parameter binding is used for all user values. Table names and query suffixes are private, fixed internal values. JSON text keeps initial migrations small while relationship keys and indexes remain relational.
+Database and migration backup files use mode 0600 on platforms supporting Unix modes. Keep backup/WAL files with their database when making manual copies; use SQLite's backup API for a live database. No automatic restore overwrites user data.
 
-Every mutation is persisted to disk. Starting a run stores the run record, monitoring state, and initial log in one transaction. State transitions and terminal outcomes are similarly atomic. Startup recovery marks all active states cancelled, closes their run records, and records an interruption event. Queued requests are volatile and dropped on restart; no queued task has started a run.
+## Tables
 
-Logs are globally capped at 10,000 events; UI snapshots include 500 recent events and 500 recent runs. Run records remain persisted until task/group deletion. Shipping/contact data is unencrypted local data. No sensitive authentication, passwords, raw payment card numbers, or proxy credentials are supported.
+| Version | Table             | Columns / purpose                                                                                                     |
+| ------- | ----------------- | --------------------------------------------------------------------------------------------------------------------- |
+| 1       | migrations        | version (PK): applied schema versions                                                                                 |
+| 1       | groups            | id (PK), data: task-group name and retailer registration ID                                                           |
+| 1       | tasks             | id (PK), group_id (FK), data: task configuration, lifecycle state, run ID, update timestamp                           |
+| 1       | profiles          | id (PK), data: contact/shipping details, named group, mock payment token                                              |
+| 1       | proxies           | id (PK), data: named group, protocol, host, port                                                                      |
+| 1       | runs              | id (PK), task_id (FK), data: start/end, outcome, optional recovery reason                                             |
+| 1       | logs              | id (PK), task_id (FK), at, data: structured task/run event                                                            |
+| 1       | settings          | id (PK), data: singleton application settings                                                                         |
+| 2       | approvals         | id (task FK and PK), data: run ID and typed cart waiting for approval                                                 |
+| 2       | checkout_attempts | id (run FK and PK), task_id (FK), data: idempotency key, cart, submission intent, status, timestamps, optional result |
+| 2       | metadata          | key (PK), value: persisted monotonically increasing snapshot revision                                                 |
+
+Indexes: tasks by group; logs by task/time; runs and checkout attempts by task. Group deletion cascades to tasks and all related history/approvals/attempts. Assigned profiles/proxies cannot be deleted until unassigned. Profile/proxy groups remain named labels. JSON text preserves v1 records and keeps domain data extensible while relational IDs provide foreign-key relationships and indexes.
+
+New `variantId` task values default to null when reading v1 data. Missing `resumeMonitoring` settings default to false. Existing groups, tasks, profiles, proxies, settings, logs and runs are retained. No plaintext card, password, or authentication-token fields are added.
+
+## Lifecycle transactions
+
+- Begin: run record, monitoring state, initial log.
+- Stock/cart transitions: state, log, and terminal history where applicable.
+- Approval: durable typed cart, awaiting-approval state, log.
+- Checkout intent: unique run/idempotency key, pending attempt, removal of approval, checking-out state, log; commit before calling the adapter.
+- Completion/failure/unknown: attempt status/result, terminal task state, closed run, log.
+- Recovery: state classification, attempt/run updates, and recovery event.
+
+No write exports the whole database. SQLite handles incremental WAL writes and checkpoints. A write failure throws; a failed lifecycle transaction rolls back its task state, log, and history together. Tests inject statement failures, failed migrations, read-only writes, and abrupt worker exits. Physical disk-full, power-loss, network-filesystem durability, and corruption repair are not established by those tests.
+
+Logs retain 10,000 events globally; snapshots expose the latest 500 logs and runs. Persisted runs remain until task/group deletion. Contact data remains unencrypted local data protected by the OS account.

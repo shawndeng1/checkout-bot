@@ -15,6 +15,8 @@ Administrative endpoints require `Authorization: Bearer <printed-token>`:
 - `POST /control/config`: optional `latencyMs`, `failNext`, `rateLimitNext`, `retryAfterMs`, `checkoutFailure`, and `dropCheckoutResponse` settings. Dropping a checkout response simulates an order being recorded while its client cannot determine the result.
 - `GET /control/metrics`: request counts and number of simulated orders created.
 
+To register this adapter in the desktop, set `ORBIT_SIMULATOR_URL` to the printed loopback origin when running `pnpm dev` or `pnpm start`. The existing group form will then list Local HTTP Simulator; choose `SKU-42` and optional variant `blue` for an initially available product. Mock scenarios apply to the mock adapter; the HTTP simulator uses its control API instead.
+
 Data and idempotency records are in memory and reset on simulator shutdown. This is a deterministic local development service, not a durable order system or a production authentication design.
 
 `packages/retailer-sdk` defines normalized capabilities, authentication requirements, product/variant references, observations with source sequence and timestamps, cart/checkout results, retailer errors, rate information and policies. `AdapterRegistry` registers named factories and rejects duplicate identifiers and non-simulated adapters. Application composition lives in `packages/adapters/src/index.ts`; future adapter registration does not require changing engine state-machine logic. The mock and HTTP adapters retain milestone-one convenience methods for compatibility.

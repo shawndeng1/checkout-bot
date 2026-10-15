@@ -1,37 +1,48 @@
-# Task engine
-
-Normal workflow:
+# Task lifecycle — Milestone 2
 
 ```text
 CREATED → MONITORING → STOCK_DETECTED → CARTING → AWAITING_APPROVAL
-                                                   ↓ explicit approval
+                                                   ↓ explicit approval + capacity
                                              CHECKING_OUT → COMPLETED
+                                                   ↓ uncertainty
+                                              UNKNOWN_OUTCOME
 ```
 
-Every active state can transition to `FAILED` or `CANCELLED`. Created tasks can be cancelled without launching. Completed, failed, and cancelled tasks can start a fresh monitoring run. All other edges, including skipping approval, are invalid. The authoritative transition map and validator are exported by `packages/core`.
+Created tasks can be cancelled. Monitoring, stock-detected, carting, and approval states can fail or cancel. Checking-out can complete, fail definitively, or become unknown; cancelling after durable submission intent conservatively means unknown. Completed/failed/cancelled tasks can start a new run. Unknown outcomes have no start/restart edge. All other edges are rejected by the exported transition validator.
 
-## Scheduling and cancellation
+## Capacity and shared monitoring
 
-Start places the task in a FIFO queue. The scheduler launches at most the configured number of active runs (1–20). Approval waits reserve a slot. Reducing concurrency allows active runs to finish; it prevents further launches until occupancy falls below the new limit. Raising it immediately pumps the queue.
+Each task retains its own configuration, history, AbortController, and approval context. Execution capacity limits requests, not task count: inventory polls, cart operations, and checkout submissions acquire a FIFO permit. Approval waits release capacity. Approved tasks queue through the bounded scheduler; duplicate approvals are no-ops and cannot create another attempt. Tasks can cancel while waiting for stock, approval, rate policy, or execution capacity.
 
-Starting an already queued/running task is a no-op. Running task edits/deletes and group deletion with active/queued tasks are rejected. Each launched run has a new UUID and adapter instance. Restart awaits cancellation before starting a fresh run. Cancellation aborts monitoring, adapter calls, exponential-backoff timers, and approval promises; it closes history as cancelled. Stop removes queued requests without starting them. Terminal tasks retain their last outcome if a subsequent queued restart request is removed before it launches.
+Compatible tasks share one product-keyed inventory poller. The key includes retailer, product, variant, profile/proxy IDs, interval, retry bound, adapter scope, and sharing capability. Observations have a source stream ID, event ID, sequence, timestamp, product, and availability. Duplicate/non-increasing events, older timestamps, and retired streams are suppressed. In-stock events resolve all current subscribers once. Reference-counted cleanup aborts the source when no subscribers remain. Tests exercise 10, 50, and 100 tasks on one subscription and verify exactly three deterministic mock polls.
 
-The approval callback is registered before the approval-state event is published, avoiding a synchronous event subscriber race. Shutdown prevents new launches, drops the queue, aborts active runs, and waits for final persistence. Crash recovery cancels interrupted states and requires explicit restart; checkout is never resumed automatically.
+Per-retailer gates constrain request concurrency and minimum spacing, and apply Retry-After to subsequent requests even if those requests were already queued globally. Global permits are released during rate-policy waits. Increasing the global limit pumps pending operations; lowering it lets active requests finish before admitting more. At most 1,000 task contexts are admitted, with 2,000 pending entries per operation gate.
 
-## Retry policy
+## Retries and typed adapter results
 
-Only `AdapterError` with `retryable=true` is retried. Each inventory/cart operation allows 0–5 configured retries after its initial attempt. Delays are `min(300 × 2^retryIndex, 10000)` milliseconds. Tests inject a 10ms base. Successful out-of-stock checks continue monitoring at the configured interval and are not failures. Checkout is never retried in this milestone; future implementations require proven idempotency before permitting retries.
+Retryable normalized errors in inventory/cart operations allow the configured 0–5 retries. Exponential delay is `min(300 × 2^attempt, 10000)` ms, extended by a longer normalized Retry-After. Tests inject a shorter base. Successful out-of-stock observations continue polling; they do not count as failures. Checkout submission is never automatically retried, including for 429, timeout, or unknown transport errors.
 
-## Deterministic mock scenarios
+The SDK provides typed product/variant references, inventory, cart, checkout, capability/authentication declarations, and rate-limit/error contracts. Adapter registration lives outside engine control flow. Only simulated adapters are enabled. Mock convenience methods remain for compatibility. The HTTP adapter accepts only a `127.0.0.1` HTTP origin, rejects redirects, validates response shapes, applies timeouts, and propagates AbortSignal cancellation.
 
-| Scenario         | Behavior                                                                |
-| ---------------- | ----------------------------------------------------------------------- |
-| available        | First two checks out of stock; third check available                    |
-| out-of-stock     | Continues monitoring until stopped                                      |
-| timeout          | Every inventory call raises a retryable timeout; fails at retry bound   |
-| rate-limit       | First two inventory calls rate-limit; third succeeds if retries permit  |
-| checkout-failure | Stock becomes available; approval leads to a terminal simulated decline |
+## Approval, intent, and recovery
 
-All mock operations use abortable delays and perform zero network requests. Cart IDs are synthetic. Adapter capabilities explicitly declare inventory, cart, checkout, and simulation support. The engine rejects adapters that do not declare simulation support.
+The cart is persisted before exposing approval. A user approval only grants permission for the current in-memory execution. Before the adapter submits checkout, the engine atomically records an intent using the run UUID as its idempotency key. The simulator returns the same order for repeated submissions with that key/cart, but Orbit does not use this as permission to retry an uncertain submission automatically.
 
-Structured logs contain event ID, task ID, run ID, timestamp, state, level, and message. Info mode logs state changes/retries; debug also logs each successful out-of-stock poll. Logs are persisted before snapshot publication.
+| Interrupted state                           | Recovery                                                                                       |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| MONITORING                                  | Close interrupted run as cancelled; restart monitoring only when `resumeMonitoring` is enabled |
+| STOCK_DETECTED / CARTING                    | Cancel; explicit restart required                                                              |
+| AWAITING_APPROVAL with saved cart           | Restore approval context; require user approval again                                          |
+| Legacy AWAITING_APPROVAL without saved cart | Cancel; explicit restart required                                                              |
+| CHECKING_OUT                                | Mark attempt/run/task UNKNOWN_OUTCOME; never automatically submit again                        |
+| UNKNOWN_OUTCOME                             | Remain blocked pending future reconciliation tooling                                           |
+
+Recovery reasons are recorded in run history. Missing optional adapters do not block UI startup: approval data remains saved and cancellable, while automatic monitoring recovery pauses. Stop/restart of an executing checkout can produce an unknown outcome, so restart is then rejected. Do not infer that an unknown outcome means failure or absence of an order.
+
+Graceful shutdown prevents new starts, aborts active/waiting work, drains shared sources, preserves saved approvals, and preserves monitoring for configured recovery. The main-process client has a 10-second fallback termination deadline. Abrupt worker-exit tests demonstrate that a committed checkout intent recovers as unknown without another submission.
+
+## Mock and HTTP simulation
+
+Mock scenarios remain available: third-check availability, indefinitely out of stock, bounded timeout failures, first-two-check rate limiting, and checkout decline. HTTP simulation adds catalog/variants, explicit inventory changes, latency, failures, 429 responses, idempotent orders, and deliberately lost checkout responses. See [SIMULATOR.md](docs/SIMULATOR.md).
+
+Structured logs retain task/run IDs, state, level, timestamp, and message. Debug mode records accepted out-of-stock observations. Revisioned snapshots are coalesced for UI delivery; full snapshots are still used rather than incremental patches.

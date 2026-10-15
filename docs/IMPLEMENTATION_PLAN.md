@@ -1,4 +1,4 @@
-# Milestone implementation plan
+# Milestone 1 implementation plan (historical)
 
 1. Inspect the existing repository and available runtime; initialize the empty pnpm workspace.
 2. Define shared domain schemas, validated commands, and retailer capabilities.
@@ -10,3 +10,5 @@
 8. Document architecture, data model, lifecycle, limitations, and the next reliability milestone.
 
 The first milestone deliberately has no live retailer integration. SQL.js avoids native Electron addon rebuilds; transactions and atomic exports preserve local data. Profile/proxy group names are configuration labels. The main process owns execution and persistence; a worker process is a future scaling step.
+
+Milestone 2 replaces the original persistence and scheduling choices; see [MILESTONE_2.md](MILESTONE_2.md) for the current implementation and validation.
