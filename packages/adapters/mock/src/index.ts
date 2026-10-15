@@ -1,5 +1,6 @@
 import {
   AdapterError,
+  RetailerError,
   simulatedCapabilities,
   productRef,
   type CartResult,
@@ -65,6 +66,6 @@ export class MockAdapter implements RetailerAdapter {
   async checkout(task: Task, _cartId: string, signal: AbortSignal) {
     await delay(task.intervalMs, signal);
     if (task.scenario === "checkout-failure")
-      throw new AdapterError("Simulated checkout declined", false);
+      throw new RetailerError("Simulated checkout declined", "DECLINED", false);
   }
 }

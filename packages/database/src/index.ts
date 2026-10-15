@@ -1,6 +1,7 @@
+import type { CartResult, CheckoutResult } from "../../retailer-sdk/src/index";
 import { migrations } from "./migrations";
 import { DatabaseSync, backup, type SQLInputValue } from "node:sqlite";
-import { mkdirSync, existsSync, chmodSync } from "node:fs";
+import { mkdirSync, existsSync, chmodSync, renameSync, rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import {
@@ -17,6 +18,7 @@ import {
 } from "../../shared-types/src/index";
 const defaults = {
   concurrency: 3,
+  resumeMonitoring: false,
   notifications: false,
   logLevel: "info" as const,
   launchView: "Dashboard" as const,
@@ -48,9 +50,19 @@ export class Store {
               .get()?.version ?? 0,
           )
         : 0;
+      if (version > migrations.at(-1)!.version)
+        throw new Error("Database was created by a newer application version");
+      if (options.readOnly && version < migrations.at(-1)!.version)
+        throw new Error("Database requires migration before read-only access");
       if (!options.readOnly && version === 1 && !existsSync(path + ".v1.bak")) {
-        await backup(store.db, path + ".v1.bak");
-        chmodSync(path + ".v1.bak", 0o600);
+        const pending = path + `.v1.bak.${randomUUID()}.tmp`;
+        try {
+          await backup(store.db, pending);
+          chmodSync(pending, 0o600);
+          renameSync(pending, path + ".v1.bak");
+        } finally {
+          if (existsSync(pending)) rmSync(pending);
+        }
       }
       if (!options.readOnly) store.initialize();
       return store;
@@ -102,6 +114,7 @@ export class Store {
     if (!this.read("settings", "app")) this.put("settings", "app", defaults);
   }
   private transaction<T>(action: () => T): T {
+    if (this.db.isTransaction) return action();
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const result = action();
@@ -121,9 +134,17 @@ export class Store {
   transition(id: string, state: TaskState, message: string) {
     this.transaction(() => {
       this.update(id, state);
-      this.log(id, message, state === "FAILED" ? "error" : "info");
-      if (["COMPLETED", "FAILED", "CANCELLED"].includes(state))
+      this.log(
+        id,
+        message,
+        ["FAILED", "UNKNOWN_OUTCOME"].includes(state) ? "error" : "info",
+      );
+      if (
+        ["COMPLETED", "FAILED", "CANCELLED", "UNKNOWN_OUTCOME"].includes(state)
+      ) {
+        this.run("DELETE FROM approvals WHERE id=?", [id]);
         this.finish(id, state);
+      }
     });
   }
   private rows<T>(table: string, suffix = ""): T[] {
@@ -144,20 +165,33 @@ export class Store {
   }
   snapshot(): Snapshot {
     return {
+      revision: this.revision(),
+      retailers: [],
       groups: this.rows("groups"),
-      tasks: this.rows("tasks"),
+      tasks: this.rows<Task>("tasks").map((task) => ({
+        ...task,
+        variantId: task.variantId ?? null,
+      })),
       profiles: this.rows("profiles"),
       proxies: this.rows("proxies"),
-      settings: this.read("settings", "app")!,
+      settings: this.getSettings(),
       logs: this.rows("logs", "ORDER BY at DESC, rowid DESC LIMIT 500"),
       runs: this.rows("runs", "ORDER BY rowid DESC LIMIT 500"),
       queued: [],
     };
   }
+  group(id: string) {
+    const group = this.read<import("../../shared-types/src/index").Group>(
+      "groups",
+      id,
+    );
+    if (!group) throw new Error("Group not found");
+    return group;
+  }
   task(id: string): Task {
     const task = this.read<Task>("tasks", id);
     if (!task) throw new Error("Task not found");
-    return task;
+    return { ...task, variantId: task.variantId ?? null };
   }
   saveGroup(input: unknown) {
     const data = groupSchema.parse(input);
@@ -282,23 +316,150 @@ export class Store {
         ]);
     }
   }
-  recover() {
+  getSettings() {
+    return settingsSchema.parse(this.read("settings", "app"));
+  }
+  revision() {
+    return Number(
+      this.db.prepare("SELECT value FROM metadata WHERE key='revision'").get()
+        ?.value ?? 0,
+    );
+  }
+  nextRevision() {
+    this.run("UPDATE metadata SET value=value+1 WHERE key='revision'");
+    return this.revision();
+  }
+  approval(id: string) {
+    return this.read<{ taskId: string; runId: string; cart: CartResult }>(
+      "approvals",
+      id,
+    );
+  }
+  prepareApproval(id: string, cart: CartResult) {
+    this.transaction(() => {
+      this.put("approvals", id, {
+        taskId: id,
+        runId: this.task(id).runId,
+        cart,
+      });
+      this.transition(
+        id,
+        "AWAITING_APPROVAL",
+        "Simulated cart ready; approve to continue",
+      );
+    });
+  }
+  beginCheckout(id: string, cart: CartResult) {
+    return this.transaction(() => {
+      const runId = this.task(id).runId;
+      if (!runId) throw new Error("No execution ID");
+      this.run("INSERT INTO checkout_attempts VALUES(?,?,?)", [
+        runId,
+        id,
+        JSON.stringify({
+          id: runId,
+          taskId: id,
+          cart,
+          status: "pending",
+          submittedAt: new Date().toISOString(),
+        }),
+      ]);
+      this.run("DELETE FROM approvals WHERE id=?", [id]);
+      this.transition(id, "CHECKING_OUT", "Processing simulated checkout");
+      return runId;
+    });
+  }
+  checkoutAttempts(id: string) {
+    return this.db
+      .prepare("SELECT data FROM checkout_attempts WHERE task_id=?")
+      .all(id)
+      .map((row) => JSON.parse(String(row.data)));
+  }
+  finishCheckout(
+    id: string,
+    state: TaskState,
+    message: string,
+    result?: CheckoutResult,
+  ) {
+    this.transaction(() => {
+      const runId = this.task(id).runId;
+      const attempt = runId
+        ? this.read<Record<string, unknown>>("checkout_attempts", runId)
+        : undefined;
+      if (attempt)
+        this.run("UPDATE checkout_attempts SET data=? WHERE id=?", [
+          JSON.stringify({
+            ...attempt,
+            status:
+              state === "COMPLETED"
+                ? "succeeded"
+                : state === "UNKNOWN_OUTCOME"
+                  ? "unknown"
+                  : "failed",
+            result,
+            endedAt: new Date().toISOString(),
+          }),
+          runId!,
+        ]);
+      this.transition(id, state, message);
+    });
+  }
+  private recoveryTag(id: string, reason: Run["recovery"]) {
+    const runId = this.task(id).runId;
+    const run = runId ? this.read<Run>("runs", runId) : undefined;
+    if (run)
+      this.run("UPDATE runs SET data=? WHERE id=?", [
+        JSON.stringify({ ...run, recovery: reason }),
+        runId!,
+      ]);
+  }
+  recover(): string[] {
+    const resume: string[] = [];
     for (const task of this.snapshot().tasks)
-      if (
-        [
-          "MONITORING",
-          "STOCK_DETECTED",
-          "CARTING",
-          "AWAITING_APPROVAL",
-          "CHECKING_OUT",
-        ].includes(task.state)
-      ) {
-        this.transition(
-          task.id,
-          "CANCELLED",
-          "Interrupted run recovered safely; explicit restart required",
-        );
-      }
+      this.transaction(() => {
+        if (task.state === "MONITORING") {
+          this.transition(
+            task.id,
+            "CANCELLED",
+            "Interrupted monitoring recovered; " +
+              (this.getSettings().resumeMonitoring
+                ? "automatic monitoring restart configured"
+                : "explicit restart required"),
+          );
+          this.recoveryTag(task.id, "interrupted-monitoring");
+          if (this.getSettings().resumeMonitoring) resume.push(task.id);
+        } else if (task.state === "AWAITING_APPROVAL") {
+          if (this.approval(task.id)) {
+            this.log(
+              task.id,
+              "Approval restored; explicit user approval required",
+            );
+            this.recoveryTag(task.id, "approval-restored");
+          } else {
+            this.transition(
+              task.id,
+              "CANCELLED",
+              "Legacy approval has no saved cart; explicit restart required",
+            );
+            this.recoveryTag(task.id, "interrupted-operation");
+          }
+        } else if (task.state === "CHECKING_OUT") {
+          this.finishCheckout(
+            task.id,
+            "UNKNOWN_OUTCOME",
+            "Interrupted checkout has an unknown outcome; automatic retry prohibited",
+          );
+          this.recoveryTag(task.id, "checkout-unknown");
+        } else if (["STOCK_DETECTED", "CARTING"].includes(task.state)) {
+          this.transition(
+            task.id,
+            "CANCELLED",
+            "Interrupted cart operation recovered; explicit restart required",
+          );
+          this.recoveryTag(task.id, "interrupted-operation");
+        }
+      });
+    return resume;
   }
   close() {
     this.db.close();

@@ -236,6 +236,12 @@ function App() {
               </Button>
             )}
           </div>
+          {data?.tasks.some((task) => task.state === "UNKNOWN_OUTCOME") && (
+            <div className="alert" role="alert">
+              A checkout outcome is unknown. Automatic retries are blocked;
+              reconcile the attempt before taking further action.
+            </div>
+          )}
           {error && (
             <div className="alert" role="alert">
               {error}
@@ -400,7 +406,10 @@ function App() {
                             <Box size={16} />
                             <div>
                               {g.name}
-                              <small>Mock Retailer</small>
+                              <small>
+                                {data.retailers.find((r) => r.id === g.retailer)
+                                  ?.name ?? g.retailer}
+                              </small>
                             </div>
                           </button>
                           <button
@@ -906,6 +915,7 @@ function EntityForm({
     Task: {
       name: "",
       product: "",
+      variantId: "",
       groupId: group !== "all" ? group : (data.groups[0]?.id ?? ""),
       profileId: "",
       proxyId: "",
@@ -951,12 +961,16 @@ function EntityForm({
       {
         key: "retailer",
         label: "Retailer",
-        options: [{ value: "mock", label: "Mock Retailer · Simulation" }],
+        options: data.retailers.map((r) => ({
+          value: r.id,
+          label: r.name + " · Simulation",
+        })),
       },
     ],
     Task: [
       { key: "name", label: "Task name" },
       { key: "product", label: "Product identifier" },
+      { key: "variantId", label: "Variant identifier (optional)" },
       {
         key: "groupId",
         label: "Task group",
@@ -1020,6 +1034,7 @@ function EntityForm({
     setSaving(true);
     const payload = { ...value };
     if (kind === "Task") {
+      payload.variantId = payload.variantId || null;
       payload.profileId = payload.profileId || null;
       payload.proxyId = payload.proxyId || null;
     }
@@ -1091,9 +1106,13 @@ function EntityForm({
                     })
                   }
                   required={
-                    !["phone", "address", "city", "postalCode"].includes(
-                      field.key,
-                    )
+                    ![
+                      "phone",
+                      "address",
+                      "city",
+                      "postalCode",
+                      "variantId",
+                    ].includes(field.key)
                   }
                   maxLength={field.type ? undefined : 200}
                 />
@@ -1144,8 +1163,29 @@ function SettingsForm({
       </div>
       <div className="setting-row">
         <div>
+          <strong>Resume interrupted monitoring</strong>
+          <p>
+            Resume inventory monitoring after restart. Checkout is never
+            automatically retried.
+          </p>
+        </div>
+        <input
+          aria-label="Resume interrupted monitoring"
+          type="checkbox"
+          checked={settings.resumeMonitoring}
+          onChange={(e) => {
+            setSaved(false);
+            setSettings({ ...settings, resumeMonitoring: e.target.checked });
+          }}
+        />
+      </div>
+      <div className="setting-row">
+        <div>
           <strong>Task concurrency</strong>
-          <p>Maximum active runs, including tasks waiting for approval.</p>
+          <p>
+            Maximum concurrent monitoring, cart, and checkout operations.
+            Approval waits release capacity.
+          </p>
         </div>
         <input
           aria-label="Task concurrency"

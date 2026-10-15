@@ -1,10 +1,11 @@
 import { EventEmitter } from "node:events";
 import { Store } from "../../database/src/index";
-import { MockAdapter } from "../../adapters/mock/src/index";
 import {
-  AdapterError,
+  AdapterRegistry,
+  RetailerError,
   delay,
   type RetailerAdapter,
+  type CartResult,
 } from "../../retailer-sdk/src/index";
 import {
   commandSchema,
@@ -12,43 +13,101 @@ import {
   type TaskState,
   type Task,
 } from "../../shared-types/src/index";
+import { RequestScheduler } from "./scheduler";
+import { SharedInventory } from "./inventory";
 export const transitions: Record<TaskState, readonly TaskState[]> = {
   CREATED: ["MONITORING", "CANCELLED"],
   MONITORING: ["STOCK_DETECTED", "FAILED", "CANCELLED"],
   STOCK_DETECTED: ["CARTING", "FAILED", "CANCELLED"],
   CARTING: ["AWAITING_APPROVAL", "FAILED", "CANCELLED"],
   AWAITING_APPROVAL: ["CHECKING_OUT", "FAILED", "CANCELLED"],
-  CHECKING_OUT: ["COMPLETED", "FAILED", "CANCELLED"],
+  CHECKING_OUT: ["COMPLETED", "FAILED", "UNKNOWN_OUTCOME"],
   COMPLETED: ["MONITORING"],
   FAILED: ["MONITORING"],
   CANCELLED: ["MONITORING"],
+  UNKNOWN_OUTCOME: [],
 };
 export function validateTransition(from: TaskState, to: TaskState) {
   if (!transitions[from].includes(to))
     throw new Error(`Invalid transition ${from} → ${to}`);
 }
 interface Active {
+  id: string;
+  adapter: RetailerAdapter;
   controller: AbortController;
   promise: Promise<void>;
   approve?: () => void;
+  approved: boolean;
+  checkoutStarted: boolean;
 }
 export class Engine extends EventEmitter {
   private active = new Map<string, Active>();
-  private queue: string[] = [];
   private shuttingDown = false;
+  private eventTimer?: ReturnType<typeof setTimeout>;
+  readonly scheduler: RequestScheduler;
+  readonly inventory: SharedInventory;
   constructor(
     readonly store: Store,
-    private factory: () => RetailerAdapter = () => new MockAdapter(),
+    readonly registry: AdapterRegistry,
     private backoffMs = 300,
   ) {
     super();
-    store.recover();
+    this.scheduler = new RequestScheduler(
+      () => store.getSettings().concurrency,
+      registry.list(),
+      () => this.publish(),
+    );
+    this.inventory = new SharedInventory(
+      this.scheduler,
+      (ids, message) => {
+        for (const id of ids) store.log(id, message);
+        this.publish();
+      },
+      backoffMs,
+      (ids) => {
+        if (store.getSettings().logLevel === "debug") {
+          for (const id of ids)
+            store.log(id, "Product out of stock; monitoring continues");
+          this.publish();
+        }
+      },
+    );
+    const resume = store.recover();
+    for (const task of store.snapshot().tasks)
+      if (task.state === "AWAITING_APPROVAL") {
+        if (registry.has(store.group(task.groupId).retailer))
+          this.launch(task.id, store.approval(task.id)!.cart);
+        else
+          store.log(
+            task.id,
+            "Approval preserved; retailer adapter unavailable on this launch",
+          );
+      }
+    for (const id of resume) {
+      if (registry.has(store.group(store.task(id).groupId).retailer))
+        this.start(id);
+      else
+        store.log(
+          id,
+          "Monitoring recovery paused; retailer adapter unavailable",
+        );
+    }
+    this.store.nextRevision();
   }
   snapshot() {
-    return { ...this.store.snapshot(), queued: [...this.queue] };
+    return {
+      ...this.store.snapshot(),
+      retailers: this.registry.list(),
+      queued: this.scheduler.queued,
+    };
   }
   private publish() {
-    this.emit("snapshot", this.snapshot());
+    this.store.nextRevision();
+    if (!this.eventTimer && !this.shuttingDown)
+      this.eventTimer = setTimeout(() => {
+        this.eventTimer = undefined;
+        this.emit("snapshot", this.snapshot());
+      }, 16);
   }
   private move(id: string, to: TaskState, message: string) {
     validateTransition(this.store.task(id).state, to);
@@ -56,52 +115,103 @@ export class Engine extends EventEmitter {
     this.publish();
   }
   isBusy(id: string) {
-    return this.active.has(id) || this.queue.includes(id);
+    return this.active.has(id) || this.store.approval(id) !== undefined;
+  }
+  diagnostics() {
+    return {
+      activeOperations: this.scheduler.capacity.active,
+      peakOperations: this.scheduler.capacity.peak,
+      activeTasks: this.active.size,
+      queued: this.scheduler.queued.length,
+      subscriptions: this.inventory.size,
+      subscribers: this.inventory.subscribers,
+      inventoryPolls: this.inventory.polls,
+      workerHeapBytes: process.memoryUsage().heapUsed,
+    };
   }
   start(id: string) {
     if (this.shuttingDown) throw new Error("Engine is shutting down");
     const task = this.store.task(id);
     if (this.isBusy(id)) return;
     validateTransition(task.state, "MONITORING");
-    this.queue.push(id);
-    this.store.log(id, "Queued for execution");
-    this.pump();
-    this.publish();
+    this.launch(id);
   }
-  private pump() {
-    while (
-      !this.shuttingDown &&
-      this.queue.length &&
-      this.active.size < this.store.snapshot().settings.concurrency
-    ) {
-      const id = this.queue.shift()!;
-      const controller = new AbortController();
-      const active: Active = { controller, promise: Promise.resolve() };
-      this.active.set(id, active);
-      active.promise = this.run(id, controller.signal).finally(() => {
+  private launch(id: string, cart?: CartResult) {
+    if (this.active.size >= 1000)
+      throw new Error("Task execution limit reached");
+    const task = this.store.task(id);
+    const adapter = this.registry.create(
+      this.store.group(task.groupId).retailer,
+    );
+    if (
+      !adapter.capabilities.inventory ||
+      !adapter.capabilities.cart ||
+      !adapter.capabilities.checkout
+    )
+      throw new Error("Adapter does not support this task workflow");
+    const context: Active = {
+      id,
+      adapter,
+      controller: new AbortController(),
+      promise: Promise.resolve(),
+      approved: false,
+      checkoutStarted: false,
+    };
+    this.active.set(id, context);
+    context.promise = this.run(context, cart)
+      .catch((error) => this.emit("fault", error))
+      .then(() => {
         this.active.delete(id);
-        this.pump();
-        this.publish();
+        try {
+          this.publish();
+        } catch (error) {
+          this.emit("fault", error);
+        }
       });
-    }
+  }
+  private approval(context: Active): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const signal = context.controller.signal;
+      const abort = () => {
+        signal.removeEventListener("abort", abort);
+        context.approve = undefined;
+        reject(new Error("Cancelled"));
+      };
+      context.approve = () => {
+        signal.removeEventListener("abort", abort);
+        context.approve = undefined;
+        resolve();
+      };
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
+    });
   }
   private async retry<T>(
     task: Task,
+    adapter: RetailerAdapter,
     signal: AbortSignal,
     action: () => Promise<T>,
   ): Promise<T> {
     for (let attempt = 0; ; attempt++) {
       try {
-        return await action();
+        return await this.scheduler.execute(
+          adapter.id,
+          task.id,
+          signal,
+          action,
+        );
       } catch (error) {
         if (
           signal.aborted ||
-          !(error instanceof AdapterError) ||
+          !(error instanceof RetailerError) ||
           !error.retryable ||
           attempt >= task.maxRetries
         )
           throw error;
-        const ms = Math.min(this.backoffMs * 2 ** attempt, 10000);
+        const ms = Math.max(
+          error.rateLimit?.retryAfterMs ?? 0,
+          Math.min(this.backoffMs * 2 ** attempt, 10000),
+        );
         this.store.log(
           task.id,
           `${error.message}; retry ${attempt + 1}/${task.maxRetries} in ${ms}ms`,
@@ -111,95 +221,144 @@ export class Engine extends EventEmitter {
       }
     }
   }
-  private async run(id: string, signal: AbortSignal) {
+  private async run(context: Active, savedCart?: CartResult) {
+    const { id, adapter } = context;
+    const signal = context.controller.signal;
     try {
-      this.store.begin(id);
-      this.publish();
-      const task = this.store.task(id);
-      const adapter = this.factory();
-      if (!adapter.capabilities.simulated)
-        throw new Error("Only simulated adapters are enabled");
-      while (
-        !(await this.retry(task, signal, () => adapter.inventory(task, signal)))
-      ) {
-        if (this.store.snapshot().settings.logLevel === "debug") {
-          this.store.log(id, "Product out of stock; monitoring continues");
-          this.publish();
-        }
+      let cart = savedCart;
+      if (!cart) {
+        this.store.begin(id);
+        this.publish();
+        const task = this.store.task(id);
+        await this.inventory.wait(task, adapter, signal);
+        if (signal.aborted) throw new Error("Cancelled");
+        this.move(id, "STOCK_DETECTED", "Inventory available");
+        this.move(id, "CARTING", "Creating simulated cart");
+        cart = await this.retry(task, adapter, signal, () =>
+          adapter.createCart(task, signal),
+        );
+        if (signal.aborted) throw new Error("Cancelled");
+        validateTransition(this.store.task(id).state, "AWAITING_APPROVAL");
+        this.store.prepareApproval(id, cart);
       }
-      if (signal.aborted) throw new Error("Cancelled");
-      this.move(id, "STOCK_DETECTED", "Mock inventory available");
-      this.move(id, "CARTING", "Creating simulated cart");
-      const cart = await this.retry(task, signal, () =>
-        adapter.cart(task, signal),
-      );
-      // Register approval before publishing the state to avoid a reentrant event race.
-      const approval = new Promise<void>((resolve, reject) => {
-        const aborted = () => {
-          signal.removeEventListener("abort", aborted);
-          reject(new Error("Cancelled"));
-        };
-        this.active.get(id)!.approve = () => {
-          signal.removeEventListener("abort", aborted);
-          resolve();
-        };
-        signal.addEventListener("abort", aborted, { once: true });
-        if (signal.aborted) aborted();
-      });
-      this.move(
-        id,
-        "AWAITING_APPROVAL",
-        "Simulated cart ready; approve to continue",
-      );
+      // Waits own a task context and durable cart, but no execution permit.
+      const approval = this.approval(context);
+      this.publish();
       await approval;
-      if (signal.aborted) throw new Error("Cancelled");
-      this.move(id, "CHECKING_OUT", "Processing simulated checkout");
-      // Checkout is deliberately not retried: future integrations must establish idempotency first.
-      await adapter.checkout(task, cart, signal);
-      if (signal.aborted) throw new Error("Cancelled");
-      this.move(id, "COMPLETED", "Simulation completed; no purchase was made");
+      const task = this.store.task(id);
+      const checkoutCart = cart;
+      await this.scheduler.execute(adapter.id, id, signal, async () => {
+        if (checkoutCart.expiresAt && checkoutCart.expiresAt <= Date.now())
+          throw new RetailerError("Simulated cart expired", "DECLINED", false);
+        validateTransition(this.store.task(id).state, "CHECKING_OUT");
+        // Durable intent/idempotency key is committed before any submission can happen.
+        const key = this.store.beginCheckout(id, checkoutCart);
+        context.checkoutStarted = true;
+        this.publish();
+        const result = await adapter.submitCheckout(
+          task,
+          checkoutCart,
+          key,
+          signal,
+        );
+        if (result.idempotencyKey !== key)
+          throw new RetailerError(
+            "Checkout response idempotency mismatch",
+            "INVALID_RESPONSE",
+            false,
+            undefined,
+            "unknown",
+          );
+        validateTransition(this.store.task(id).state, "COMPLETED");
+        this.store.finishCheckout(
+          id,
+          "COMPLETED",
+          "Simulation completed; no purchase was made",
+          result,
+        );
+        this.publish();
+      });
     } catch (error) {
-      const state = signal.aborted ? "CANCELLED" : "FAILED";
-      this.move(
-        id,
-        state,
-        signal.aborted
+      const task = this.store.task(id);
+      if (
+        this.shuttingDown &&
+        !context.checkoutStarted &&
+        (task.state === "AWAITING_APPROVAL" ||
+          (task.state === "MONITORING" &&
+            this.store.getSettings().resumeMonitoring))
+      ) {
+        this.store.log(
+          id,
+          task.state === "AWAITING_APPROVAL"
+            ? "Approval preserved for next launch"
+            : "Monitoring preserved for configured recovery",
+        );
+        return;
+      }
+      const unknown =
+        context.checkoutStarted &&
+        (!(error instanceof RetailerError) ||
+          error.outcome === "unknown" ||
+          signal.aborted);
+      const state = unknown
+        ? "UNKNOWN_OUTCOME"
+        : signal.aborted
+          ? "CANCELLED"
+          : "FAILED";
+      validateTransition(task.state, state);
+      const message = unknown
+        ? "Checkout outcome unknown; automatic retry prohibited"
+        : signal.aborted
           ? "Task stopped"
           : error instanceof Error
             ? error.message
-            : "Execution failed",
-      );
+            : "Execution failed";
+      if (context.checkoutStarted)
+        this.store.finishCheckout(id, state, message);
+      else this.store.transition(id, state, message);
+      this.publish();
     }
   }
   async stop(id: string) {
     this.store.task(id);
-    if (this.queue.includes(id)) {
-      this.queue = this.queue.filter((item) => item !== id);
-      if (this.store.task(id).state === "CREATED")
-        this.move(id, "CANCELLED", "Queued task stopped");
-      else {
-        this.store.log(id, "Removed from queue");
-        this.publish();
-      }
-    }
-    const active = this.active.get(id);
-    if (active) {
-      active.controller.abort();
-      await active.promise;
-    }
+    const context = this.active.get(id);
+    if (context) {
+      context.controller.abort();
+      await context.promise;
+    } else if (this.store.task(id).state === "AWAITING_APPROVAL")
+      this.move(id, "CANCELLED", "Saved approval cancelled");
   }
   approve(id: string) {
-    if (this.store.task(id).state !== "AWAITING_APPROVAL")
+    if (this.store.task(id).state !== "AWAITING_APPROVAL") {
+      if (this.active.get(id)?.approved) return;
       throw new Error("Task is not awaiting approval");
-    const active = this.active.get(id);
-    if (!active?.approve) throw new Error("No active approval");
-    active.approve();
-    active.approve = undefined;
+    }
+    const context = this.active.get(id);
+    if (!context)
+      throw new Error(
+        "Approval cannot resume: retailer adapter is unavailable; restart with the registered adapter or stop this task",
+      );
+    if (context.approved) return;
+    if (!context.approve) throw new Error("Approval is not ready");
+    context.approved = true;
+    context.approve();
+    this.publish();
   }
   async command(input: Command) {
     const cmd = commandSchema.parse(input);
     switch (cmd.type) {
       case "saveGroup":
+        if (
+          cmd.data.id &&
+          this.store.group(cmd.data.id).retailer !== cmd.data.retailer &&
+          this.store
+            .snapshot()
+            .tasks.some(
+              (task) => task.groupId === cmd.data.id && this.isBusy(task.id),
+            )
+        )
+          throw new Error("Stop tasks before changing their retailer");
+        this.registry.get(cmd.data.retailer);
         this.store.saveGroup(cmd.data);
         break;
       case "saveProfile":
@@ -211,11 +370,12 @@ export class Engine extends EventEmitter {
       case "saveTask":
         if (cmd.data.id && this.isBusy(cmd.data.id))
           throw new Error("Stop the task before editing");
+        this.registry.get(this.store.group(cmd.data.groupId).retailer);
         this.store.saveTask(cmd.data);
         break;
       case "settings":
         this.store.settings(cmd.data);
-        this.pump();
+        this.scheduler.capacity.pump();
         break;
       case "start":
         this.start(cmd.id);
@@ -263,9 +423,12 @@ export class Engine extends EventEmitter {
   }
   async shutdown() {
     this.shuttingDown = true;
-    this.queue = [];
     const active = [...this.active.values()];
-    active.forEach((a) => a.controller.abort());
-    await Promise.all(active.map((a) => a.promise));
+    active.forEach((context) => context.controller.abort());
+    await Promise.all(active.map((context) => context.promise));
+    await this.inventory.drain();
+    if (this.eventTimer) clearTimeout(this.eventTimer);
+    this.eventTimer = undefined;
+    this.emit("snapshot", this.snapshot());
   }
 }

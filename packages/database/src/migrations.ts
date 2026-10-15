@@ -14,4 +14,14 @@ export const migrations = [
    CREATE INDEX IF NOT EXISTS runs_task ON runs(task_id);
 `,
   },
+  {
+    version: 2,
+    sql: `
+    CREATE TABLE approvals(id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE, data TEXT NOT NULL);
+    CREATE TABLE checkout_attempts(id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, data TEXT NOT NULL);
+    CREATE INDEX attempts_task ON checkout_attempts(task_id);
+    CREATE TABLE metadata(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+    INSERT INTO metadata VALUES('revision',0);
+  `,
+  },
 ];

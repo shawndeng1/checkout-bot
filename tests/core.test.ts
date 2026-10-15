@@ -2,6 +2,7 @@ import { beforeEach, afterEach, describe, it, expect, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createAdapters } from "../packages/adapters/src/index";
 import { Store } from "../packages/database/src/index";
 import {
   Engine,
@@ -19,7 +20,7 @@ let dir: string, store: Store, engine: Engine, groupId: string;
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "retail-test-"));
   store = await Store.open(join(dir, "db.sqlite"));
-  engine = new Engine(store, undefined, 10);
+  engine = new Engine(store, createAdapters(), 10);
   groupId = store.saveGroup({ name: "Test group", retailer: "mock" });
   vi.useFakeTimers();
 });
@@ -83,28 +84,32 @@ describe("execution", () => {
     await engine.stop(id);
     expect(store.task(id).state).toBe("CANCELLED");
   });
-  it("limits concurrency and prevents duplicate execution", async () => {
-    store.settings({ ...store.snapshot().settings, concurrency: 1 });
+  it("limits operations and prevents duplicate execution while sharing subscriptions", async () => {
+    store.settings({ ...store.getSettings(), concurrency: 1 });
     const a = add(),
       b = add();
     engine.start(a);
     engine.start(a);
     engine.start(b);
-    expect(engine.snapshot().queued).toEqual([b]);
-    expect(store.snapshot().runs).toHaveLength(1);
-    await engine.stop(a);
-    expect(store.task(b).state).toBe("MONITORING");
     expect(store.snapshot().runs).toHaveLength(2);
+    expect(engine.inventory.subscribers).toBe(2);
+    await advance();
+    expect(store.task(a).state).toBe("AWAITING_APPROVAL");
+    expect(store.task(b).state).toBe("AWAITING_APPROVAL");
+    expect(engine.diagnostics().peakOperations).toBe(1);
   });
-  it("cancels a queued task without launching it", async () => {
-    store.settings({ ...store.snapshot().settings, concurrency: 1 });
+  it("cancels a task waiting for execution capacity", async () => {
+    store.settings({ ...store.getSettings(), concurrency: 1 });
     const a = add(),
       b = add();
     engine.start(a);
     engine.start(b);
+    await advance(501);
+    expect(engine.snapshot().queued).toContain(b);
     await engine.stop(b);
     expect(store.task(b).state).toBe("CANCELLED");
-    expect(engine.snapshot().queued).toEqual([]);
+    expect(store.approval(b)).toBeUndefined();
+    expect(engine.snapshot().queued).not.toContain(b);
   });
   it("bounds exponential retries on timeouts", async () => {
     const id = add("timeout");
@@ -198,7 +203,7 @@ describe("persistence and service", () => {
     await engine.shutdown();
     store.close();
     store = await Store.open(join(dir, "db.sqlite"));
-    engine = new Engine(store);
+    engine = new Engine(store, createAdapters());
     const snapshot = engine.snapshot();
     expect(snapshot.groups).toHaveLength(1);
     expect(snapshot.tasks).toHaveLength(1);
@@ -213,7 +218,7 @@ describe("persistence and service", () => {
     const runId = store.begin(id);
     store.close();
     store = await Store.open(join(dir, "db.sqlite"));
-    engine = new Engine(store);
+    engine = new Engine(store, createAdapters());
     expect(store.task(id).state).toBe("CANCELLED");
     expect(store.snapshot().runs.find((r) => r.id === runId)?.outcome).toBe(
       "CANCELLED",
@@ -286,7 +291,7 @@ it("rejects malformed proxy IPs and accepts supported host syntax", () => {
     expect(proxySchema.safeParse({ ...input, host }).success).toBe(true);
 });
 it("cancels during a retry backoff without waiting for its timer", async () => {
-  engine = new Engine(store, undefined, 5000);
+  engine = new Engine(store, createAdapters(), 5000);
   const id = add("timeout");
   engine.start(id);
   await advance(150);
@@ -295,18 +300,22 @@ it("cancels during a retry backoff without waiting for its timer", async () => {
   ).toBe(true);
   await engine.stop(id);
   expect(store.task(id).state).toBe("CANCELLED");
+  await engine.shutdown();
   expect(vi.getTimerCount()).toBe(0);
 });
-it("increasing concurrency immediately launches waiting tasks", async () => {
-  store.settings({ ...store.snapshot().settings, concurrency: 1 });
+it("increasing concurrency immediately launches waiting operations", async () => {
+  store.settings({ ...store.getSettings(), concurrency: 1 });
   const a = add(),
     b = add();
   engine.start(a);
   engine.start(b);
+  await advance(501);
+  expect(engine.snapshot().queued).toContain(b);
   await engine.command({
     type: "settings",
-    data: { ...store.snapshot().settings, concurrency: 2 },
+    data: { ...store.getSettings(), concurrency: 2 },
   });
+  await advance(1);
   expect(engine.snapshot().queued).toEqual([]);
-  expect(store.task(b).state).toBe("MONITORING");
+  expect(engine.diagnostics().peakOperations).toBe(2);
 });

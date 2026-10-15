@@ -104,9 +104,9 @@ export interface RetailerAdapter {
     signal: AbortSignal,
   ): Promise<CheckoutResult>;
   /** Compatibility facade for milestone-one consumers. */
-  inventory(task: Task, signal: AbortSignal): Promise<boolean>;
-  cart(task: Task, signal: AbortSignal): Promise<string>;
-  checkout(task: Task, cartId: string, signal: AbortSignal): Promise<void>;
+  inventory?(task: Task, signal: AbortSignal): Promise<boolean>;
+  cart?(task: Task, signal: AbortSignal): Promise<string>;
+  checkout?(task: Task, cartId: string, signal: AbortSignal): Promise<void>;
 }
 export interface RetailerDefinition {
   id: string;
@@ -134,6 +134,9 @@ export class AdapterRegistry {
       throw new Error("Invalid retailer rate policy");
     this.definitions.set(definition.id, definition);
     return this;
+  }
+  has(id: string) {
+    return this.definitions.has(id);
   }
   get(id: string) {
     const definition = this.definitions.get(id);

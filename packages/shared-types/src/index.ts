@@ -9,6 +9,7 @@ export const states = [
   "COMPLETED",
   "FAILED",
   "CANCELLED",
+  "UNKNOWN_OUTCOME",
 ] as const;
 export type TaskState = (typeof states)[number];
 const name = z.string().trim().min(1).max(120);
@@ -97,6 +98,7 @@ function validProxyHost(host: string): boolean {
 export const settingsSchema = z
   .object({
     concurrency: z.number().int().min(1).max(20),
+    resumeMonitoring: z.boolean().default(false),
     notifications: z.boolean(),
     logLevel: z.enum(["info", "debug"]),
     launchView: z.enum([
@@ -133,8 +135,15 @@ export interface Run {
   startedAt: string;
   endedAt: string | null;
   outcome: TaskState;
+  recovery?:
+    | "interrupted-monitoring"
+    | "approval-restored"
+    | "checkout-unknown"
+    | "interrupted-operation";
 }
 export interface Snapshot {
+  revision: number;
+  retailers: { id: string; name: string }[];
   groups: Group[];
   tasks: Task[];
   profiles: Profile[];

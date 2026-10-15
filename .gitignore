@@ -4,3 +4,8 @@ dist/
 *.sqlite.tmp
 test-results/
 playwright-report/
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite.v1.bak
+*.sqlite.*.tmp
+.pnpm-store/

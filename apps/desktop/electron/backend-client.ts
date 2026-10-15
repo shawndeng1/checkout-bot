@@ -4,8 +4,9 @@ import type {
   Command,
   Snapshot,
 } from "../../../packages/shared-types/src/index";
+import type { Engine } from "../../../packages/core/src/index";
 interface Pending {
-  resolve(value: Snapshot): void;
+  resolve(value: unknown): void;
   reject(error: Error): void;
 }
 /** Main-process transport only. No database or engine is loaded in this isolate. */
@@ -45,7 +46,7 @@ export class BackendClient extends EventEmitter {
         reject(error);
       });
       this.worker.on("exit", (code) => {
-        if (!this.closing || code !== 0) {
+        if (!this.closing) {
           const error = new Error(`Backend worker exited (${code})`);
           this.fail(error);
           reject(error);
@@ -59,17 +60,20 @@ export class BackendClient extends EventEmitter {
     this.requests.clear();
     this.emit("failure", error);
   }
-  private async request(
-    type: "snapshot" | "command" | "shutdown",
+  private async request<T = Snapshot>(
+    type: "snapshot" | "command" | "shutdown" | "metrics",
     command?: Command,
-  ): Promise<Snapshot> {
+  ): Promise<T> {
     await this.ready;
     if (this.failure) throw this.failure;
     if (this.closing && type !== "shutdown")
       throw new Error("Backend is shutting down");
     const id = ++this.sequence;
-    return new Promise((resolve, reject) => {
-      this.requests.set(id, { resolve, reject });
+    return new Promise<T>((resolve, reject) => {
+      this.requests.set(id, {
+        resolve: (value) => resolve(value as T),
+        reject,
+      });
       this.worker.postMessage({ id, type, command });
     });
   }
@@ -79,13 +83,34 @@ export class BackendClient extends EventEmitter {
   command(command: Command) {
     return this.request("command", command);
   }
+  metrics() {
+    return this.request<ReturnType<Engine["diagnostics"]>>("metrics");
+  }
   async shutdown() {
     if (this.closing) return;
     this.closing = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await this.request("shutdown");
+      await Promise.race([
+        this.request("shutdown"),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () =>
+              reject(
+                new Error(
+                  "Backend shutdown timed out; interrupted operations require recovery",
+                ),
+              ),
+            10000,
+          );
+        }),
+      ]);
     } finally {
+      if (timer) clearTimeout(timer);
       await this.worker.terminate();
+      for (const pending of this.requests.values())
+        pending.reject(new Error("Backend closed"));
+      this.requests.clear();
     }
   }
 }

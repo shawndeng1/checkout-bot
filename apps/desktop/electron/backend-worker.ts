@@ -1,10 +1,17 @@
 import { parentPort, workerData } from "node:worker_threads";
 import { Store } from "../../../packages/database/src/index";
+import { createAdapters } from "../../../packages/adapters/src/index";
 import { Engine } from "../../../packages/core/src/index";
 import { ZodError } from "zod";
 async function boot() {
   const store = await Store.open(workerData.databasePath);
-  const engine = new Engine(store);
+  const engine = new Engine(
+    store,
+    createAdapters(process.env.ORBIT_SIMULATOR_URL),
+  );
+  engine.on("fault", (error) =>
+    parentPort!.postMessage({ type: "fatal", error: String(error) }),
+  );
   engine.on("snapshot", (data) =>
     parentPort!.postMessage({ type: "snapshot", data }),
   );
@@ -14,6 +21,7 @@ async function boot() {
       try {
         let data;
         if (request.type === "snapshot") data = engine.snapshot();
+        else if (request.type === "metrics") data = engine.diagnostics();
         else if (request.type === "command")
           data = await engine.command(request.command);
         else if (request.type === "shutdown") {

@@ -116,9 +116,12 @@ else {
     if (!quitting && engine) {
       event.preventDefault();
       quitting = true;
-      void engine.shutdown().then(() => {
-        app.quit();
-      });
+      void engine
+        .shutdown()
+        .catch((error) => console.error(error))
+        .then(() => {
+          app.quit();
+        });
     }
   });
 }

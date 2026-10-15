@@ -63,7 +63,7 @@ test("desktop CRUD, live events, stop, logs and restart persistence", async () =
       .getByRole("button", { name: "Logs Edited watch", exact: true })
       .click();
     await expect(
-      page.getByText("Mock inventory available", { exact: true }),
+      page.getByText("Inventory available", { exact: true }),
     ).toBeVisible();
     await expect(
       page.getByText("Simulation completed; no purchase was made", {
@@ -231,6 +231,133 @@ test("development renderer launches with the secure preload bridge", async () =>
   } finally {
     await app?.close();
     await server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("approval waits release capacity and survive a full desktop restart", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "orbit-approval-e2e-"));
+  let app: ElectronApplication | undefined;
+  const launch = () =>
+    electron.launch({
+      args: ["dist/electron/main.cjs"],
+      env: { ...process.env, RETAIL_DATA_DIR: dir },
+    });
+  try {
+    app = await launch();
+    let page = await app.firstWindow();
+    await expect(
+      page.getByRole("heading", { name: "Workspace overview" }),
+    ).toBeVisible();
+    await page.evaluate(async () => {
+      let data = await window.retail.snapshot();
+      await window.retail.command({
+        type: "settings",
+        data: { ...data.settings, concurrency: 1 },
+      });
+      data = await window.retail.command({
+        type: "saveGroup",
+        data: { name: "Approval group", retailer: "mock" },
+      });
+      const groupId = data.groups[0].id;
+      for (let i = 0; i < 3; i++)
+        await window.retail.command({
+          type: "saveTask",
+          data: {
+            name: `Approval ${i}`,
+            product: "shared",
+            variantId: null,
+            groupId,
+            profileId: null,
+            proxyId: null,
+            scenario: "available",
+            intervalMs: 100,
+            maxRetries: 2,
+          },
+        });
+    });
+    await page
+      .getByRole("button", { name: "Tasks", exact: false })
+      .first()
+      .click();
+    await expect(page.getByText("Approval 2", { exact: true })).toBeVisible();
+    await page.getByRole("checkbox", { name: "Select all tasks" }).check();
+    await page.getByRole("button", { name: "Start", exact: true }).click();
+    await expect(
+      page.getByRole("button", { name: "Approve", exact: true }),
+    ).toHaveCount(3);
+    await app.close();
+    app = await launch();
+    page = await app.firstWindow();
+    await expect(
+      page.getByRole("heading", { name: "Workspace overview" }),
+    ).toBeVisible();
+    await page
+      .getByRole("button", { name: "Tasks", exact: false })
+      .first()
+      .click();
+    await expect(
+      page.getByRole("button", { name: "Approve", exact: true }),
+    ).toHaveCount(3);
+    for (let i = 0; i < 3; i++)
+      await page
+        .getByRole("row")
+        .filter({ hasText: `Approval ${i}` })
+        .getByRole("button", { name: "Approve", exact: true })
+        .click();
+    await expect(page.getByText("completed", { exact: true })).toHaveCount(3);
+  } finally {
+    await app?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("registers the local HTTP adapter and completes a variant workflow through the existing UI", async () => {
+  const { startSimulator } = await import("../../packages/simulator/src/index");
+  const simulator = await startSimulator();
+  const dir = mkdtempSync(path.join(tmpdir(), "orbit-http-e2e-"));
+  let app: ElectronApplication | undefined;
+  try {
+    app = await electron.launch({
+      args: ["dist/electron/main.cjs"],
+      env: {
+        ...process.env,
+        RETAIL_DATA_DIR: dir,
+        ORBIT_SIMULATOR_URL: simulator.url,
+      },
+    });
+    const page = await app.firstWindow();
+    await expect(
+      page.getByRole("heading", { name: "Workspace overview" }),
+    ).toBeVisible();
+    await page
+      .getByRole("button", { name: "Tasks", exact: false })
+      .first()
+      .click();
+    await page.getByRole("button", { name: "New group", exact: true }).click();
+    await page.getByLabel("Group name").fill("HTTP group");
+    await page
+      .getByLabel("Retailer", { exact: true })
+      .selectOption("simulator");
+    await page.getByRole("button", { name: "Save group" }).click();
+    await page.getByRole("button", { name: "New task", exact: true }).click();
+    await page.getByLabel("Task name").fill("HTTP variant");
+    await page.getByLabel("Product identifier", { exact: true }).fill("SKU-42");
+    await page.getByLabel("Variant identifier").fill("blue");
+    await page.getByLabel("Monitor interval").fill("100");
+    await page.getByRole("button", { name: "Save task" }).click();
+    await page
+      .getByRole("button", { name: "Start HTTP variant", exact: true })
+      .click();
+    await expect(
+      page.getByRole("button", { name: "Approve", exact: true }),
+    ).toBeVisible();
+    await page.getByRole("button", { name: "Approve", exact: true }).click();
+    await expect(page.getByText("completed", { exact: true })).toBeVisible();
+    expect(simulator.metrics.ordersCreated).toBe(1);
+  } finally {
+    await app?.close();
+    await simulator.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });
