@@ -1,0 +1,44 @@
+{
+  "name": "retail-automation",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.25.0",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "vite build --config apps/desktop/vite.config.ts && node scripts/build.mjs",
+    "start": "electron dist/electron/main.cjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:e2e": "pnpm build && playwright test",
+    "format": "prettier --write apps packages scripts tests docs *.md *.ts *.json *.yaml",
+    "format:check": "prettier --check apps packages scripts tests docs *.md *.ts *.json *.yaml"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "sql.js": "^1.13.0",
+    "zod": "^4.1.12",
+    "zustand": "^5.0.8"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.0",
+    "@tailwindcss/vite": "^4.1.14",
+    "@types/node": "^22.18.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@types/sql.js": "^1.4.9",
+    "@vitejs/plugin-react": "^5.0.4",
+    "electron": "^41.0.0",
+    "esbuild": "^0.25.10",
+    "prettier": "^3.9.10",
+    "tailwindcss": "^4.1.14",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.9",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}
