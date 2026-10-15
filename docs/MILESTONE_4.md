@@ -55,7 +55,25 @@ An initial same-parent run revealed retained RSS across trials; the committed me
 
 **Authorized live Shopify pilot: NOT EXECUTED, pending developer-store configuration and credentials.** Four gated live cases remain skipped without explicit enablement. The suite performs only authorized reads, asks the enabled operator to change test stock manually, verifies notification/history/restart/cancellation, and never makes inventory mutations or orders. Real throttle evidence is observational and skipped unless naturally encountered; no traffic flooding is used. Native notification presentation is a separate manual acceptance step. See [SHOPIFY_PILOT.md](../SHOPIFY_PILOT.md).
 
-Local validation runs on macOS with Node 24.19.0, Electron 41.10.7 and pnpm 11.25.0. CI configuration targets macOS, Windows and Ubuntu 24.04. Remote CI results are pending a pushed workflow run; configuration alone is not claimed as cross-platform success. Linux uses Xvfb and runner-specific user namespace setup; the application sandbox remains enabled. Actual keyring lock/unlock and native notification permissions are not asserted by mocked encryption-provider tests or fixture GUI tests.
+Local validation runs on macOS with Node 24.19.0, Electron 41.10.7 and pnpm 11.25.0. [GitHub Actions run 38800486587](https://github.com/shawndeng1/checkout-bot/actions/runs/38800486587) passed on tested commit `1690898` on all three platforms:
+
+| Runner         | Unit/integration           | Electron GUI      | Typecheck / build / format |
+| -------------- | -------------------------- | ----------------- | -------------------------- |
+| macos-latest   | 105 passed; 4 live skipped | 8 passed (49.3 s) | Passed                     |
+| windows-latest | 105 passed; 4 live skipped | 8 passed (29.2 s) | Passed                     |
+| ubuntu-24.04   | 105 passed; 4 live skipped | 8 passed (23.0 s) | Passed                     |
+
+The initial run passed on macOS/Linux but failed Windows formatting because checkout converted files to CRLF. A repository `.gitattributes` rule now preserves LF text checkouts; the full rerun above passed, including Windows GUI tests. Linux uses Xvfb and runner-specific user namespace setup; the application sandbox remains enabled. Actual keyring lock/unlock and native notification permissions are not asserted by mocked encryption-provider tests or fixture GUI tests. The subsequent documentation-only delivery commit records these results without changing the tested application.
+
+## Delivery commits
+
+- `d965266`: persistent simulator orders, idempotency and delayed completion.
+- `d0f0478`: product discovery, inventory history, diagnostics and credential lifecycle.
+- `7d8ea22`: cross-platform CI, gated live pilot and isolated benchmarks.
+- `5bd797b`: milestone documentation and measured results.
+- `1690898`: LF checkout policy; tested by the successful three-platform run above.
+
+These commits were pushed to `origin/main`. The working tree was clean before recording these final CI results.
 
 ## Limitations and next milestone
 
@@ -64,7 +82,7 @@ Local validation runs on macOS with Node 24.19.0, Electron 41.10.7 and pnpm 11.2
 - Inventory history is bounded at 10,000 rows; other histories still use recent snapshot windows. Product details are refreshed through discovery/monitoring rather than an indexed offline catalog. Full snapshots of current state remain; pagination/deltas for other histories and multi-account profiles are future work.
 - Worker recovery after exit is explicit application restart; backend RPC/health timeouts are diagnostics, not permission to resubmit any operation. Credential-file/SQLite atomicity is limited as described above.
 - Simulator persistence is a single-owner development service. Physical power-loss/corruption repair, large durable-order throughput, multi-server operation and real reconciliation are not validated. Missing source/key evidence remains unknown.
-- Signed installers are outside this milestone. Remote platform failures must be assessed from actual CI results rather than inferred from local tests.
+- Signed installers are outside this milestone. Hosted-runner success does not establish compatibility with every supported OS version or native credential/notification provider.
 
 Recommended Milestone 5: execute the authorized developer-store pilot; verify cross-platform OS-keychain/native delivery; add revisioned deltas and other history pagination, worker recovery controls, durable backup/restore tests and a longer monitoring soak. Continue to exclude real purchasing and access-control bypass.
 
